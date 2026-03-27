@@ -12,3 +12,4 @@ logs/*.log
 *.egg-info/
 dist/
 build/
+nohup.out
