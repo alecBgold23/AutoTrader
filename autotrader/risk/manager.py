@@ -11,6 +11,23 @@ from autotrader.db.models import get_session, Trade, RiskEvent, PortfolioSnapsho
 
 logger = logging.getLogger(__name__)
 
+# Slippage estimate: 0.1% per side (entry + exit) = 0.2% round trip
+ESTIMATED_SLIPPAGE_PER_SIDE = 0.001
+ESTIMATED_SLIPPAGE_ROUND_TRIP = ESTIMATED_SLIPPAGE_PER_SIDE * 2
+
+# Max positions in a single correlated sector group
+MAX_SECTOR_CONCENTRATION = 2
+
+# Correlated stock groups — stocks that move together
+CORRELATED_GROUPS = {
+    "mega_tech": ["AAPL", "MSFT", "GOOGL", "META", "AMZN"],
+    "semis": ["NVDA", "AMD", "INTC", "AVGO", "QCOM", "MU", "TSM"],
+    "ev_auto": ["TSLA", "RIVN", "LCID", "NIO", "LI"],
+    "banking": ["JPM", "BAC", "WFC", "GS", "MS", "C"],
+    "energy": ["XOM", "CVX", "COP", "SLB", "OXY"],
+    "biotech": ["MRNA", "BNTX", "PFE", "JNJ", "ABBV"],
+}
+
 
 @dataclass
 class TradeProposal:
@@ -66,7 +83,7 @@ class RiskManager:
         self._cooldown_until = None
         logger.info("Trading resumed")
 
-    def check_trade(self, proposal: TradeProposal, portfolio: dict, market_phase: str = "") -> RiskVerdict:
+    def check_trade(self, proposal: TradeProposal, portfolio: dict, market_phase: str = "", regime_multiplier: float = 1.0) -> RiskVerdict:
         """Run all risk checks on a proposed trade."""
         # ── Check: Is trading halted? ──────────────────
         if self.is_halted:
@@ -136,21 +153,32 @@ class RiskManager:
                     f"({RISK['max_total_exposure_pct']:.0%})"
                 )
 
-        # ── Check: Risk/Reward ratio ───────────────────
+        # ── Check: Sector/correlation concentration ─────
+        if proposal.side == "BUY":
+            sector_ok, sector_reason = self._check_sector_concentration(
+                proposal.symbol, portfolio.get("positions", [])
+            )
+            if not sector_ok:
+                return RiskVerdict(False, sector_reason)
+
+        # ── Check: Risk/Reward ratio (slippage-adjusted) ─
         if proposal.side == "BUY" and proposal.stop_loss and proposal.take_profit:
-            risk = abs(proposal.current_price - proposal.stop_loss)
-            reward = abs(proposal.take_profit - proposal.current_price)
-            if risk > 0:
+            slippage_per_share = proposal.current_price * ESTIMATED_SLIPPAGE_ROUND_TRIP
+            risk = abs(proposal.current_price - proposal.stop_loss) + slippage_per_share
+            reward = abs(proposal.take_profit - proposal.current_price) - slippage_per_share
+            if risk > 0 and reward > 0:
                 rr_ratio = reward / risk
                 if rr_ratio < RISK["min_risk_reward_ratio"]:
                     return RiskVerdict(
                         False,
-                        f"R/R ratio {rr_ratio:.1f}:1 below minimum {RISK['min_risk_reward_ratio']}:1"
+                        f"R/R ratio {rr_ratio:.1f}:1 below minimum {RISK['min_risk_reward_ratio']}:1 (after slippage)"
                     )
+            elif risk > 0:
+                return RiskVerdict(False, "Reward negative after slippage adjustment")
 
         # ── Calculate position size ────────────────────
         if proposal.side == "BUY":
-            quantity = self._calculate_position_size(proposal, equity, buying_power, market_phase)
+            quantity = self._calculate_position_size(proposal, equity, buying_power, market_phase, regime_multiplier)
 
             # Use Claude's hint if it's more conservative
             if proposal.quantity_hint > 0:
@@ -190,10 +218,12 @@ class RiskManager:
         else:
             self._consecutive_losses += 1
 
-    def _calculate_position_size(self, proposal: TradeProposal, equity: float, buying_power: float, market_phase: str = "") -> int:
+    def _calculate_position_size(self, proposal: TradeProposal, equity: float, buying_power: float, market_phase: str = "", regime_multiplier: float = 1.0) -> int:
         """Calculate number of shares using fixed-fractional position sizing.
 
-        Adjusts size by market phase — smaller during open/lunch, full during prime/power_hour.
+        Adjusts size by market phase AND market regime.
+        Phase: smaller during open/lunch, full during prime/power_hour.
+        Regime: reduced in bear/volatile markets.
         """
         risk_amount = equity * RISK["max_risk_per_trade_pct"]
 
@@ -201,6 +231,9 @@ class RiskManager:
         phase_conf = PHASE_CONFIG.get(market_phase, {})
         size_multiplier = phase_conf.get("size_multiplier", 1.0)
         risk_amount *= size_multiplier
+
+        # Regime-based size adjustment (stacks with phase)
+        risk_amount *= regime_multiplier
         stop_loss_pct = RISK["default_stop_loss_pct"]
 
         if proposal.stop_loss and proposal.current_price > 0:
@@ -209,17 +242,45 @@ class RiskManager:
         if stop_loss_pct <= 0:
             stop_loss_pct = RISK["default_stop_loss_pct"]
 
+        # Account for slippage: widen effective stop distance
+        adjusted_stop_pct = stop_loss_pct + ESTIMATED_SLIPPAGE_ROUND_TRIP
+
         price = proposal.current_price
         if price <= 0:
             return 0
 
-        risk_based_shares = risk_amount / (price * stop_loss_pct)
+        risk_based_shares = risk_amount / (price * adjusted_stop_pct)
         max_by_buying_power = buying_power / price
         max_by_position = (equity * RISK["max_position_pct"]) / price
 
         shares = min(risk_based_shares, max_by_buying_power, max_by_position)
 
         return max(0, int(shares))
+
+    def _check_sector_concentration(self, symbol: str, positions: list) -> tuple[bool, str]:
+        """Prevent too much exposure to correlated stocks.
+
+        E.g., holding AAPL + MSFT + GOOGL is really one bet on tech.
+        Max 2 positions per correlated group.
+        """
+        new_group = None
+        for group, members in CORRELATED_GROUPS.items():
+            if symbol in members:
+                new_group = group
+                break
+
+        if new_group is None:
+            return True, ""  # Unknown sector — allow
+
+        # Count existing positions in the same group
+        held_symbols = [p.get("symbol") for p in positions]
+        group_members = CORRELATED_GROUPS[new_group]
+        same_group = [s for s in held_symbols if s in group_members]
+
+        if len(same_group) >= MAX_SECTOR_CONCENTRATION:
+            return False, f"Sector concentration: already holding {', '.join(same_group)} in {new_group}"
+
+        return True, ""
 
     def _get_daily_pnl(self) -> float | None:
         """Get today's P&L from the portfolio snapshots."""

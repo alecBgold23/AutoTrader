@@ -21,11 +21,12 @@ autotrader/
     analyst.py                  # ClaudeAnalyst — sends data to Claude, parses JSON responses
     prompts.py                  # System prompt + analysis/ranking prompt templates
   data/
-    market.py                   # Yahoo Finance wrappers (get_stock_data, get_current_price, get_intraday_data)
+    market.py                   # Alpaca real-time + yfinance historical (get_stock_data, get_current_price, get_intraday_data)
     indicators.py               # Technical indicators (RSI, MACD, Bollinger, VWAP, ATR, etc.)
     patterns.py                 # Candlestick + chart pattern detection, key levels (S/R, ORB)
     scanner.py                  # MarketScanner — builds universe, scores stocks, surfaces hot list
-    news.py                     # Finnhub news fetcher
+    news.py                     # Alpaca News API — catalyst detection for prompt
+    regime.py                   # MarketRegime — SPY trend + VIX level → regime-aware sizing
   execution/
     broker.py                   # AlpacaBroker — order execution, position management, portfolio snapshots
     stalker.py                  # EntryStalker — limit order management for patient entries
@@ -34,6 +35,11 @@ autotrader/
     position_manager.py         # PositionManager — trailing stops, scale-outs (1/3 at 1R, 1/3 at 2R)
   alerts/
     telegram.py                 # TelegramAlerts — trade notifications, daily summaries
+  analytics/
+    performance.py              # Performance tracking — metrics by pattern, phase, day, rolling 20
+  backtest/
+    engine.py                   # Backtest engine — replay historical days through trading logic
+    runner.py                   # CLI: python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-01
   db/
     models.py                   # SQLAlchemy models (Trade, Decision, PortfolioSnapshot, RiskEvent, TradingJournal)
 scripts/
@@ -65,7 +71,8 @@ logs/                           # Daily log files + launchd output
 | `_snapshot_portfolio` | 30 min | Save portfolio state to DB |
 | `_rebuild_universe` | Daily 9:00 AM ET | Full market rescan |
 | `_eod_close_all` | Daily 3:50 PM ET | Close all positions |
-| `_daily_summary` | Daily 4:30 PM ET | Journal entry, then auto-shutdown |
+| `_daily_summary` | Daily 4:30 PM ET | Journal entry + performance log, then auto-shutdown |
+| `_weekly_performance_report` | Friday 4:45 PM ET | Full analytics report via Telegram |
 
 ### 3. Trading Loop (`_trading_loop`)
 1. Check risk halt status and market hours
@@ -124,20 +131,89 @@ Time-of-day awareness is built into every layer — prompts, risk thresholds, po
 ## Risk Management
 
 ### Hard Limits (config.py → RISK dict)
-- **Max risk per trade**: 3% of equity
-- **Max single position**: 8% of equity
-- **Max total exposure**: 60% of equity
-- **Max daily loss**: 4% → halts trading
-- **Max drawdown**: 15% from peak → full stop
-- **Min R:R ratio**: 2:1
-- **Max trades/day**: 30
-- **Consecutive loss limit**: 4 → 30 min cooldown
+- **Max risk per trade**: 1% of equity
+- **Max single position**: 5% of equity
+- **Max total exposure**: 40% of equity
+- **Max daily loss**: 2% → halts trading
+- **Max drawdown**: 10% from peak → full stop
+- **Min R:R ratio**: 2:1 (slippage-adjusted)
+- **Max trades/day**: 8
+- **Consecutive loss limit**: 3 → 30 min cooldown
 - **Daily R limit**: -3R → stop trading
+- **Max sector concentration**: 2 positions per correlated group
+
+### Sector/Correlation Concentration
+Prevents concentrated bets on correlated stocks (e.g., AAPL + MSFT + GOOGL = one tech bet).
+Six groups defined in `manager.py`: mega_tech, semis, ev_auto, banking, energy, biotech.
+Max 2 positions per group. Unknown-sector stocks are unrestricted.
+
+### Slippage Modeling
+All R:R checks and position sizing account for estimated slippage (0.1% per side, 0.2% round trip).
+- R:R check: risk widened, reward narrowed by slippage before comparing to 2:1 minimum
+- Position sizing: stop distance widened by 0.2% → slightly fewer shares → real-world-accurate risk
+
+### Broker-Side Stop Losses
+Every position has a corresponding Alpaca stop order placed immediately after fill. This provides crash protection — if the system goes down, stops are enforced by the broker. Stop orders are:
+- Placed after every BUY (market or limit fill)
+- Updated (cancel + re-place) when trailing stops move up
+- Adjusted for remaining quantity after scale-outs
+- Reconciled on startup: any position without a broker stop gets one at 3% below current price
 
 ### Position Sizing
-Fixed-fractional: `risk_amount = equity * 0.03 * phase_size_multiplier`
-Then: `shares = risk_amount / (price * stop_loss_distance_pct)`
+Fixed-fractional: `risk_amount = equity * 0.01 * phase_multiplier * regime_multiplier`
+Then: `shares = risk_amount / (price * (stop_distance + slippage))`
 Capped by buying power and max position concentration.
+
+### Graceful Degradation on API Failure
+- Claude API calls retry 3x with exponential backoff (2s, 4s, 8s)
+- After 5+ consecutive failures: new entries halted, Telegram alert sent
+- Position management (trailing stops, scale-outs) continues without Claude
+- Price fetches fall back to last known cached price if API fails
+- Normal operation resumes automatically when API recovers
+
+---
+
+## Market Data Strategy
+
+- **Real-time prices** (`get_current_price`): Alpaca snapshots — no delay, broker-native, falls back to yfinance for non-Alpaca symbols (e.g., ^VIX)
+- **Intraday bars** (`get_intraday_data`): Alpaca 5-min bars — consistent, real-time, falls back to yfinance
+- **Historical daily** (`get_stock_data`): yfinance — free, good for 3mo+ lookbacks for indicator calculation
+- **Batch prices** (`get_batch_prices`): yfinance — efficient for 800+ stock universe scans
+
+---
+
+## Performance Analytics (`autotrader/analytics/performance.py`)
+
+Calculates running metrics from the trade database:
+- **Overall**: win rate, profit factor, Sharpe ratio, max drawdown, expectancy, avg R per trade
+- **By pattern**: win rate and avg R for each setup type — identifies which patterns Claude is good/bad at
+- **By phase**: win rate and avg R for each market phase — validates time-of-day strategy
+- **By day of week**: systematic performance differences
+- **Rolling 20-trade window**: recent trend (improving vs degrading)
+- **Auto-flagging**: patterns with WR < 35% + negative R (10+ trades) flagged for removal
+
+Reports run daily (logged) and weekly (Telegram).
+
+---
+
+## Backtesting (`autotrader/backtest/`)
+
+Replays historical days through the same Claude → Risk → Position logic.
+
+```bash
+# Quick test (cheap, ~$5)
+python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-01-31 --symbols AAPL,NVDA,TSLA,AMD,META
+
+# Full validation with Haiku (~$10-20)
+python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-01 --model claude-haiku-4-5-20251001
+
+# Final Sonnet run (~$30)
+python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-01
+```
+
+Key design: $0.02/share slippage, API response caching (repeat runs don't re-call Claude), each run saves JSON results to `data/backtest_results/`.
+
+**Minimum bar before real money:** 200+ trades, positive expectancy, profit factor > 1.3, max drawdown < 8%.
 
 ---
 
@@ -163,7 +239,6 @@ ANTHROPIC_API_KEY=...
 CLAUDE_MODEL=claude-sonnet-4-20250514
 TELEGRAM_BOT_TOKEN=         # Optional
 TELEGRAM_CHAT_ID=           # Optional
-FINNHUB_API_KEY=            # Optional (news)
 AUTONOMY_MODE=full_auto     # full_auto | notify_first | require_approval
 LOG_LEVEL=INFO
 ```
@@ -198,7 +273,7 @@ python run.py
 
 ## Key Design Decisions
 
-1. **No bracket orders for buys** — They create child orders that lock shares, preventing sells. PositionManager handles stops/targets instead.
+1. **No bracket orders for buys** — They create child orders that lock shares, preventing sells. Standalone stop orders are placed after each fill instead, and managed (cancel/replace) as trailing stops move.
 
 2. **Cancel orders before closing positions** — `cancel_orders_for_symbol()` is always called before `close_position()` to free any held shares.
 
@@ -212,9 +287,31 @@ python run.py
 
 ---
 
+## Market Awareness (regime + catalyst + trade budget)
+
+### Market Regime (`autotrader/data/regime.py`)
+Detects market conditions using SPY trend (above/below 50-day SMA) + VIX level:
+- **bull_quiet**: VIX < 16, SPY above 50SMA → full size (1.0x)
+- **bull_volatile**: VIX > 22, SPY above 50SMA → reduced size (0.70x)
+- **bear_quiet**: VIX < 22, SPY below 50SMA → half size (0.50x)
+- **bear_volatile**: VIX > 30, SPY below 50SMA → minimal size (0.25x)
+
+Regime multiplier stacks with the phase multiplier in position sizing:
+`risk_amount = equity * 1% * phase_multiplier * regime_multiplier`
+
+Updated once per trading loop cycle. Blocks all new trades when VIX extreme + bearish SPY.
+
+### News / Catalyst (`autotrader/data/news.py`)
+Uses Alpaca's built-in News API (no extra API key needed — uses broker credentials).
+Formats output as CATALYST DETECTED or NO RECENT CATALYST for Claude's analysis.
+
+### Trade Budget
+Claude sees "{trades_today}/8 trades used" and is taught to pace itself.
+
+---
+
 ## Known Issues / Not Yet Configured
 
-- **Finnhub API key** not set — news fetching returns 401 errors (gracefully handled, trading works without it)
 - **Telegram** not configured — alerts are silently skipped
 - **No shorting** — System is long-only. SELL signals on unowned stocks are skipped.
 - **Scanner uses yfinance batch downloads** — Can be slow on initial universe build (~2-3 min for 800 stocks)
@@ -224,7 +321,7 @@ python run.py
 ## Dependencies
 
 ```
-alpaca-py>=0.30.0           # Broker API
+alpaca-py>=0.30.0           # Broker API + News API
 anthropic>=0.39.0           # Claude API
 pandas>=2.2.0               # Data manipulation
 ta>=0.11.0                  # Technical indicators
@@ -234,7 +331,6 @@ sqlalchemy>=2.0.30          # ORM
 python-telegram-bot>=21.0   # Alerts
 apscheduler>=3.10.4         # Job scheduling
 aiohttp>=3.9.0              # Async HTTP
-finnhub-python>=2.4.20      # News API
 ```
 
 Python 3.14, venv at `./venv/`

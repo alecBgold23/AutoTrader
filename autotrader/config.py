@@ -25,9 +25,6 @@ CLAUDE_MAX_TOKENS = 1500
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ── Finnhub (optional, for news) ──────────────────────
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-
 # ── Market Scanner ────────────────────────────────────
 SCANNER = {
     # Universe filters
@@ -71,25 +68,25 @@ MARKET_CLOSE_MINUTE = 0
 
 # ── Risk Management ───────────────────────────────────
 RISK = {
-    # Position sizing
-    "max_risk_per_trade_pct": 0.03,      # 3% of portfolio per trade (slightly aggressive)
-    "max_position_pct": 0.08,            # 8% of portfolio in one stock
-    "max_total_exposure_pct": 0.60,      # 60% of portfolio deployed at once
+    # Position sizing — conservative until system is proven
+    "max_risk_per_trade_pct": 0.01,      # 1% of portfolio per trade (was 3%)
+    "max_position_pct": 0.05,            # 5% of portfolio in one stock (was 8%)
+    "max_total_exposure_pct": 0.40,      # 40% of portfolio deployed at once (was 60%)
 
-    # Loss limits
-    "max_daily_loss_pct": 0.04,          # 4% daily loss → halt trading
-    "max_weekly_loss_pct": 0.08,         # 8% weekly loss → halt trading
-    "max_drawdown_pct": 0.15,            # 15% from peak → full stop
+    # Loss limits — tighter for unproven system
+    "max_daily_loss_pct": 0.02,          # 2% daily loss → halt trading (was 4%)
+    "max_weekly_loss_pct": 0.05,         # 5% weekly loss → halt trading (was 8%)
+    "max_drawdown_pct": 0.10,            # 10% from peak → full stop (was 15%)
 
     # Stop loss / take profit
     "default_stop_loss_pct": 0.03,       # 3% stop loss (tighter for day trades)
     "trailing_stop_pct": 0.02,           # 2% trailing stop
     "min_risk_reward_ratio": 2.0,        # Minimum 2:1 reward-to-risk
 
-    # Circuit breakers
-    "max_consecutive_losses": 4,         # Pause after 4 losses in a row
+    # Circuit breakers — tighter limits
+    "max_consecutive_losses": 3,         # Pause after 3 losses in a row (was 4)
     "cooldown_after_losses_minutes": 30, # 30 min cooldown (faster for day trading)
-    "max_trades_per_day": 30,            # Higher limit for day trading
+    "max_trades_per_day": 8,             # Limit churn (was 30)
 
     # Confidence thresholds
     "min_confidence_to_trade": 0.55,     # 55%+ to trade (let Claude use judgment)

@@ -1,75 +1,103 @@
-"""News and sentiment data fetching."""
+"""News and catalyst detection via Alpaca's built-in News API.
+
+Replaces Finnhub (which required a separate API key we never had).
+Alpaca News is included with the trading account — no extra key needed.
+"""
 
 import logging
 from datetime import datetime, timedelta, timezone
 
+from alpaca.data.news import NewsClient
+from alpaca.data.requests import NewsRequest
+from alpaca.common.exceptions import APIError
+
+from autotrader.config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+
 logger = logging.getLogger(__name__)
 
-# Finnhub is optional — gracefully degrade if not available
-try:
-    import finnhub
-    FINNHUB_AVAILABLE = True
-except ImportError:
-    FINNHUB_AVAILABLE = False
+
+def _get_news_client() -> NewsClient:
+    """Create an Alpaca News client using existing broker credentials."""
+    return NewsClient(
+        api_key=ALPACA_API_KEY,
+        secret_key=ALPACA_SECRET_KEY,
+    )
 
 
-def get_news(symbol: str, api_key: str = "", days_back: int = 3) -> list[dict]:
-    """Fetch recent news for a symbol via Finnhub.
+def get_news(symbol: str, hours_back: int = 24) -> list[dict]:
+    """Fetch recent news for a symbol via Alpaca News API.
+
+    Args:
+        symbol: Stock ticker
+        hours_back: How far back to look (default 24h for day trading)
 
     Returns:
-        List of dicts: [{headline, summary, source, url, datetime}, ...]
+        List of dicts: [{headline, summary, source, url, datetime, sentiment}, ...]
     """
-    if not api_key or not FINNHUB_AVAILABLE:
-        logger.debug(f"News not available for {symbol} (no API key or finnhub not installed)")
+    if not ALPACA_API_KEY:
+        logger.debug("No Alpaca API key — news unavailable")
         return []
 
     try:
-        client = finnhub.Client(api_key=api_key)
+        client = _get_news_client()
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=days_back)
+        start = end - timedelta(hours=hours_back)
 
-        news = client.company_news(
-            symbol,
-            _from=start.strftime("%Y-%m-%d"),
-            to=end.strftime("%Y-%m-%d"),
+        request = NewsRequest(
+            symbols=[symbol],
+            start=start,
+            end=end,
+            limit=10,
+            sort="desc",
         )
+        news = client.get_news(request)
 
         results = []
-        for article in news[:10]:  # Limit to 10 most recent
+        for article in news.news:
             results.append({
-                "headline": article.get("headline", ""),
-                "summary": article.get("summary", ""),
-                "source": article.get("source", ""),
-                "url": article.get("url", ""),
-                "datetime": datetime.fromtimestamp(
-                    article.get("datetime", 0), tz=timezone.utc
-                ).isoformat(),
-                "sentiment": _basic_headline_sentiment(article.get("headline", "")),
+                "headline": article.headline or "",
+                "summary": article.summary or "",
+                "source": article.source or "",
+                "url": article.url or "",
+                "datetime": article.created_at.isoformat() if article.created_at else "",
+                "sentiment": _basic_headline_sentiment(article.headline or ""),
             })
 
         return results
 
+    except APIError as e:
+        logger.error(f"Alpaca News API error for {symbol}: {e}")
+        return []
     except Exception as e:
         logger.error(f"Failed to fetch news for {symbol}: {e}")
         return []
 
 
-def get_market_news(api_key: str = "") -> list[dict]:
-    """Fetch general market news."""
-    if not api_key or not FINNHUB_AVAILABLE:
+def get_market_news(hours_back: int = 12) -> list[dict]:
+    """Fetch general market news (no symbol filter)."""
+    if not ALPACA_API_KEY:
         return []
 
     try:
-        client = finnhub.Client(api_key=api_key)
-        news = client.general_news("general", min_id=0)
+        client = _get_news_client()
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=hours_back)
+
+        request = NewsRequest(
+            start=start,
+            end=end,
+            limit=10,
+            sort="desc",
+        )
+        news = client.get_news(request)
 
         results = []
-        for article in news[:10]:
+        for article in news.news:
             results.append({
-                "headline": article.get("headline", ""),
-                "summary": article.get("summary", ""),
-                "source": article.get("source", ""),
-                "url": article.get("url", ""),
+                "headline": article.headline or "",
+                "summary": article.summary or "",
+                "source": article.source or "",
+                "url": article.url or "",
             })
         return results
 
@@ -79,24 +107,38 @@ def get_market_news(api_key: str = "") -> list[dict]:
 
 
 def format_news_for_prompt(news: list[dict]) -> str:
-    """Format news articles into a concise string for Claude."""
-    if not news:
-        return "No recent news available."
+    """Format news as CATALYST or NO RECENT CATALYST for Claude.
 
+    Day trading context: recent news = potential catalyst driving the move.
+    No news = be more cautious about why the stock is moving.
+    """
+    if not news:
+        return "NO RECENT CATALYST — No news in last 24h. If this stock is moving, the reason is unclear. Be cautious about entries without a known catalyst."
+
+    # Check if any headline has meaningful sentiment
+    has_catalyst = False
     lines = []
     for i, article in enumerate(news[:5], 1):
         sentiment = article.get("sentiment", "neutral")
-        lines.append(f"{i}. [{sentiment.upper()}] {article['headline']}")
+        headline = article["headline"]
+        if sentiment != "neutral":
+            has_catalyst = True
+        tag = sentiment.upper()
+        lines.append(f"{i}. [{tag}] {headline}")
         if article.get("summary"):
-            # Truncate long summaries
             summary = article["summary"][:200]
             lines.append(f"   {summary}")
 
-    return "\n".join(lines)
+    if has_catalyst:
+        header = "CATALYST DETECTED — Recent news may be driving price action:"
+    else:
+        header = "NEWS (neutral sentiment — may not be driving today's move):"
+
+    return f"{header}\n" + "\n".join(lines)
 
 
 def _basic_headline_sentiment(headline: str) -> str:
-    """Very basic keyword-based sentiment (fallback when Claude isn't used for this)."""
+    """Basic keyword-based sentiment scoring."""
     headline_lower = headline.lower()
 
     bullish_words = [

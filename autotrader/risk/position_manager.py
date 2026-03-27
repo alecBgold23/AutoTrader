@@ -38,6 +38,7 @@ class ManagedPosition:
     realized_pnl: float = 0.0
     highest_price: float = 0.0  # For trailing stop
     scale_out_stage: int = 0    # 0=full, 1=sold 1/3, 2=sold 2/3
+    broker_stop_order_id: str = ""  # Alpaca stop order ID for broker-side protection
 
     def __post_init__(self):
         self.risk_per_share = abs(self.entry_price - self.stop_loss)

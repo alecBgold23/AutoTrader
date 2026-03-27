@@ -11,6 +11,7 @@ Feeds Claude:
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 
 import anthropic
@@ -28,7 +29,6 @@ from autotrader.data.patterns import (
 )
 from autotrader.data.news import get_news, format_news_for_prompt
 from autotrader.risk.manager import TradeProposal
-from autotrader.config import FINNHUB_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +51,15 @@ class AnalysisResult:
     raw_response: str
 
 
+MAX_API_RETRIES = 3
+
+
 class ClaudeAnalyst:
     """Uses Claude to analyze stocks and make trading decisions."""
 
     def __init__(self):
         self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.consecutive_failures = 0  # Track for graceful degradation
 
     def analyze(
         self,
@@ -64,6 +68,7 @@ class ClaudeAnalyst:
         scanner_flags: str = "",
         trades_today: int = 0,
         market_phase: str = "",
+        regime_context: str = "",
     ) -> AnalysisResult | None:
         """Full multi-timeframe analysis with pattern detection."""
         try:
@@ -108,8 +113,8 @@ class ClaudeAnalyst:
             )
             levels_text = format_levels_for_prompt(key_levels)
 
-            # 6. News
-            news = get_news(symbol, api_key=FINNHUB_API_KEY)
+            # 6. News / Catalyst
+            news = get_news(symbol)
             news_text = format_news_for_prompt(news)
 
             # 7. Build prompt
@@ -126,15 +131,34 @@ class ClaudeAnalyst:
                 detected_patterns=patterns_text,
                 key_levels=levels_text,
                 market_phase=market_phase,
+                regime_context=regime_context,
             )
 
-            # 8. Ask Claude
-            response = self.client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=CLAUDE_MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            # 8. Ask Claude (with retry + exponential backoff)
+            response = None
+            for attempt in range(MAX_API_RETRIES):
+                try:
+                    response = self.client.messages.create(
+                        model=CLAUDE_MODEL,
+                        max_tokens=CLAUDE_MAX_TOKENS,
+                        system=SYSTEM_PROMPT,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    self.consecutive_failures = 0  # Reset on success
+                    break
+                except anthropic.APIError as e:
+                    if attempt < MAX_API_RETRIES - 1:
+                        wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                        logger.warning(f"Claude API retry {attempt+1}/{MAX_API_RETRIES} in {wait}s: {e}")
+                        time.sleep(wait)
+                    else:
+                        self.consecutive_failures += 1
+                        logger.error(f"Claude API failed after {MAX_API_RETRIES} retries for {symbol}")
+                        return None
+
+            if not response:
+                self.consecutive_failures += 1
+                return None
 
             raw_text = response.content[0].text.strip()
 
@@ -160,6 +184,7 @@ class ClaudeAnalyst:
             )
 
         except anthropic.APIError as e:
+            self.consecutive_failures += 1
             logger.error(f"Claude API error analyzing {symbol}: {e}")
             return None
         except Exception as e:

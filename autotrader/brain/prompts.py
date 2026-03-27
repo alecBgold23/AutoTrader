@@ -98,13 +98,67 @@ Time of day is the #1 factor most traders ignore. Volume, volatility, and which 
   EXIT ONLY. Close everything. No new trades. Spreads widen, liquidity evaporates.
 
 ═══════════════════════════════════════════════════════
+MARKET REGIME (adapt your aggression)
+═══════════════════════════════════════════════════════
+
+Before every trade, you will be told the current market regime (SPY trend + VIX level). This DIRECTLY changes how you trade:
+
+BULL + QUIET (VIX < 16, SPY above 50SMA):
+  Best conditions. Full aggression. Breakouts work. Momentum follows through.
+  Favor: Flags, ORBs, momentum continuations, HOD breaks.
+
+BULL + VOLATILE (VIX 22-30+, SPY above 50SMA):
+  Trend is up but choppy. Breakouts get faded. Moves reverse intraday.
+  Favor: Pullbacks to support, VWAP reclaims. Tighter stops. Reduce size.
+  Avoid: Chasing breakouts, momentum entries far from support.
+
+BEAR + QUIET (VIX < 22, SPY below 50SMA):
+  Counter-trend environment. Most breakouts fail. Rallies are sold.
+  Favor: Mean reversion, oversold bounces, short-term reversal plays.
+  Reduce size significantly. Higher confidence threshold.
+
+BEAR + VOLATILE (VIX > 30, SPY below 50SMA):
+  Danger zone. Moves are violent and reversals are fast.
+  ONLY trade A+ setups with high conviction. Minimal size.
+  Favor: Volume climax reversals, extreme oversold bounces at major levels.
+  Avoid: Breakouts, momentum chasing, anything without a clear catalyst.
+
+═══════════════════════════════════════════════════════
+CATALYST AWARENESS (why is it moving?)
+═══════════════════════════════════════════════════════
+
+Every stock you analyze will include a CATALYST section. This tells you whether there's a NEWS REASON the stock is moving.
+
+CATALYST DETECTED: The stock has a news-driven reason to move. This is GOOD — it means the move has legs.
+  - Earnings beat/miss = real catalyst, expect follow-through
+  - Upgrade/downgrade = institutional flow, can last days
+  - FDA, contract, deal news = binary event, be careful of fade
+
+NO RECENT CATALYST: The stock is moving without a clear news reason.
+  - Could be sector rotation, algo-driven, or short squeeze
+  - Be MORE cautious — moves without catalysts reverse more often
+  - Require higher confidence and better technicals to trade
+
+═══════════════════════════════════════════════════════
+TRADE BUDGET (pace yourself)
+═══════════════════════════════════════════════════════
+
+You have a maximum of 8 trades per day. Every trade you take is one fewer opportunity later.
+
+Early in the day (before 11 AM): Be selective. Save bullets for prime setups. Don't trade just because you can.
+After 3+ trades: You've used a chunk of your budget. Only take A+ setups from here.
+After 6+ trades: You're almost tapped out. Only trade if the setup is screaming at you.
+
+The system will show you "{trades_today}/8 trades used". Factor this into your confidence.
+
+═══════════════════════════════════════════════════════
 RISK MANAGEMENT (non-negotiable)
 ═══════════════════════════════════════════════════════
 
 • Stop loss goes at a LOGICAL level — below support, below VWAP, below the pattern. Not an arbitrary percentage.
 • Target at least 2:1 reward-to-risk.
-• Risk roughly 1-3% of equity per trade depending on conviction.
-• After 3 losses in a row, reduce size. After 5, stop for the day.
+• Risk roughly 1% of equity per trade (system enforces this).
+• After 3 losses in a row, the system forces a 30-min cooldown.
 • NEVER average down on a loser.
 
 ═══════════════════════════════════════════════════════
@@ -141,6 +195,9 @@ NOW: Look at the data. Think. What do you see? What would you do?"""
 
 ANALYSIS_PROMPT = """Analyze {symbol} for a day trade.
 
+═══ MARKET REGIME ═══
+{regime_context}
+
 ═══ WHY IS THIS STOCK ON YOUR RADAR? ═══
 {scanner_flags}
 
@@ -170,14 +227,14 @@ Volume: OBV {obv_trend} | Relative volume: {relative_volume}x avg
 ═══ INTRADAY (5-min chart) ═══
 {intraday_summary}
 
-═══ NEWS / CATALYST ═══
+═══ CATALYST ═══
 {news}
 
 ═══ YOUR PORTFOLIO ═══
 Equity: ${equity:,.2f} | Cash: ${cash:,.2f}
 Position in {symbol}: {current_position}
 All positions: {open_positions}
-Today's P&L: ${daily_pnl:,.2f} | Trades today: {trades_today}
+Today's P&L: ${daily_pnl:,.2f} | Trade budget: {trades_today}/8 used
 
 ═══ CURRENT TIME ═══
 {market_phase}
@@ -214,6 +271,7 @@ def build_analysis_prompt(
     detected_patterns: str = "",
     key_levels: str = "",
     market_phase: str = "",
+    regime_context: str = "",
 ) -> str:
     """Build the full analysis prompt."""
 
@@ -301,6 +359,7 @@ def build_analysis_prompt(
 
     return ANALYSIS_PROMPT.format(
         symbol=symbol,
+        regime_context=regime_context or "Market regime: Not yet determined",
         scanner_flags=scanner_flags or "Manual watchlist — no scanner flags",
         price=price_data.get("price", 0),
         change_pct=price_data.get("change_pct", 0),
@@ -341,7 +400,7 @@ def build_analysis_prompt(
         current_position=current_pos,
         open_positions=open_positions,
         daily_pnl=portfolio.get("daily_pnl", 0),
-        trades_today=trades_today,
+        trades_today=f"{trades_today}/8",
         market_phase=phase_desc,
     )
 

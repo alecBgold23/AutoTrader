@@ -294,6 +294,23 @@ class AlpacaBroker:
             logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
 
+    def place_stop_loss(self, symbol: str, qty: int, stop_price: float) -> str | None:
+        """Place a broker-side stop loss order. Returns order ID or None."""
+        order = self._place_stop_loss(symbol, qty, stop_price)
+        if order:
+            logger.info(
+                f"BROKER STOP placed: {symbol} {qty} shares @ ${stop_price:.2f} "
+                f"(order_id={order.id})"
+            )
+            return str(order.id)
+        return None
+
+    def replace_stop_loss(self, old_order_id: str, symbol: str, qty: int, new_stop: float) -> str | None:
+        """Cancel old stop and place a new one at a different price/quantity. Returns new order ID."""
+        if old_order_id:
+            self.cancel_order(old_order_id)
+        return self.place_stop_loss(symbol, qty, new_stop)
+
     # ── Private methods ────────────────────────────────
 
     def _place_market_order(self, symbol: str, qty: int, side: OrderSide):

@@ -39,7 +39,9 @@ from autotrader.alerts.telegram import TelegramAlerts
 from autotrader.data.scanner import MarketScanner
 from autotrader.data.market import get_current_price
 from autotrader.execution.stalker import EntryStalker
+from autotrader.data.regime import MarketRegime
 from autotrader.db.models import init_db, get_session, Trade, Decision, TradingJournal
+from autotrader.analytics.performance import calculate_metrics, format_metrics_for_log, format_metrics_for_telegram
 
 logger = logging.getLogger("autotrader")
 
@@ -55,12 +57,15 @@ class AutoTrader:
         self.telegram = TelegramAlerts(risk_manager=self.risk, broker=self.broker)
         self.scanner = MarketScanner()
         self.stalker = EntryStalker()
+        self.regime = MarketRegime()
         self.scheduler = AsyncIOScheduler()
         self._running = False
         self._trades_today = 0
         self._wins_today = 0
         self._losses_today = 0
         self._daily_r = 0.0  # Total R earned today
+        self._last_prices: dict[str, float] = {}  # Fallback prices for position management
+        self._api_failure_alerted = False  # Prevent spamming Telegram alerts
 
     async def start(self):
         """Start the trading system."""
@@ -88,6 +93,9 @@ class AutoTrader:
         # Initial scan
         self.scanner.scan_for_movers()
         logger.info(f"Hot list: {len(self.scanner.hot_list)} candidates")
+
+        # Reconcile: ensure all existing positions have broker-side stop orders
+        await self._reconcile_broker_stops()
 
         # ── Schedule jobs ──────────────────────────────
 
@@ -158,8 +166,20 @@ class AutoTrader:
             name="Daily Summary",
         )
 
+        # Weekly performance report (Friday 4:45 PM ET)
+        self.scheduler.add_job(
+            self._weekly_performance_report,
+            CronTrigger(day_of_week="fri", hour=16, minute=45, timezone="US/Eastern"),
+            id="weekly_report",
+            name="Weekly Performance Report",
+        )
+
         self.scheduler.start()
         self._running = True
+
+        # Initial regime check
+        self.regime.update()
+        regime_label = self.regime.state.regime if self.regime.state else "unknown"
 
         logger.info("AutoTrader is LIVE.")
         await self.telegram.send_message(
@@ -167,6 +187,7 @@ class AutoTrader:
             f"Equity: ${account.get('equity', 0):,.2f}\n"
             f"Universe: {len(self.scanner.universe)} stocks\n"
             f"Hot list: {len(self.scanner.hot_list)} movers\n"
+            f"Regime: {regime_label}\n"
             f"Mode: {AUTONOMY_MODE} | EOD close: {CLOSE_ALL_EOD}"
         )
 
@@ -208,6 +229,12 @@ class AutoTrader:
 
         market_phase = self._get_market_phase()
 
+        # Update market regime (SPY trend + VIX level)
+        self.regime.update()
+        if not self.regime.should_trade():
+            logger.warning("Regime block: extreme conditions — skipping cycle")
+            return
+
         # Dynamically adjust scan interval based on phase
         phase_conf = PHASE_CONFIG.get(market_phase, {})
         new_interval = phase_conf.get("scan_interval", SCAN_INTERVAL_NORMAL)
@@ -223,8 +250,9 @@ class AutoTrader:
         if market_phase == "lunch":
             logger.info("Lunch period — scanning with reduced candidates")
 
+        regime_label = self.regime.state.regime if self.regime.state else "unknown"
         logger.info(
-            f"--- Trading cycle | Phase: {market_phase} | "
+            f"--- Trading cycle | Phase: {market_phase} | Regime: {regime_label} | "
             f"Hot list: {len(self.scanner.hot_list)} | "
             f"Trades: {self._trades_today} | R: {self._daily_r:+.1f} ---"
         )
@@ -292,13 +320,34 @@ class AutoTrader:
     async def _analyze_and_trade(self, symbol: str, portfolio: dict, scanner_flags: str, market_phase: str):
         """Analyze one symbol with full pattern detection and potentially trade."""
 
+        # Check for sustained API failures — halt new entries but keep position management running
+        if self.analyst.consecutive_failures >= 5:
+            if not self._api_failure_alerted:
+                self._api_failure_alerted = True
+                logger.error(f"Claude API: {self.analyst.consecutive_failures} consecutive failures — halting new entries")
+                await self.telegram.send_message(
+                    f"*ALERT: Claude API Down*\n"
+                    f"{self.analyst.consecutive_failures} consecutive failures.\n"
+                    f"New entries halted. Position management continues.\n"
+                    f"Will resume when API recovers."
+                )
+            return
+
         result = self.analyst.analyze(
             symbol=symbol,
             portfolio=portfolio,
             scanner_flags=scanner_flags,
             trades_today=self._trades_today,
             market_phase=market_phase,
+            regime_context=self.regime.get_regime_context_for_prompt(),
         )
+
+        # Reset alert flag on successful API call
+        if result and self._api_failure_alerted:
+            self._api_failure_alerted = False
+            logger.info("Claude API recovered — resuming normal operation")
+            await self.telegram.send_message("*Claude API Recovered* — resuming normal trading")
+
         if not result:
             return
 
@@ -329,6 +378,13 @@ class AutoTrader:
 
             # Close the entire position
             if result.confidence >= RISK["min_confidence_to_trade"]:
+                # Track R-multiple before removing position
+                if symbol in self.positions.positions:
+                    pos = self.positions.positions[symbol]
+                    if pos.risk_per_share > 0:
+                        r_earned = (float(owned["current_price"]) - pos.entry_price) / pos.risk_per_share
+                        self._daily_r += r_earned
+
                 success = self.broker.close_position(symbol)
                 if success:
                     self._trades_today += 1
@@ -369,7 +425,8 @@ class AutoTrader:
             return
 
         proposal = self.analyst.to_trade_proposal(result, current_price)
-        verdict = self.risk.check_trade(proposal, portfolio, market_phase)
+        regime_mult = self.regime.get_size_multiplier()
+        verdict = self.risk.check_trade(proposal, portfolio, market_phase, regime_mult)
 
         if not verdict.approved:
             logger.info(f"{symbol}: BLOCKED — {verdict.reason}")
@@ -449,6 +506,12 @@ class AutoTrader:
                         take_profit=result.take_profit,
                         pattern=result.pattern,
                     )
+                    # Place broker-side stop loss for crash protection
+                    stop_id = self.broker.place_stop_loss(
+                        symbol, int(verdict.adjusted_quantity), result.stop_loss
+                    )
+                    if stop_id and symbol in self.positions.positions:
+                        self.positions.positions[symbol].broker_stop_order_id = stop_id
 
                 await self.telegram.send_trade_alert({
                     "symbol": symbol,
@@ -492,6 +555,12 @@ class AutoTrader:
                             take_profit=result.take_profit,
                             pattern=result.pattern,
                         )
+                        # Place broker-side stop loss for crash protection
+                        stop_id = self.broker.place_stop_loss(
+                            symbol, int(verdict.adjusted_quantity), result.stop_loss
+                        )
+                        if stop_id and symbol in self.positions.positions:
+                            self.positions.positions[symbol].broker_stop_order_id = stop_id
 
     # ══════════════════════════════════════════════════════
     # POSITION MANAGEMENT (runs every 2 min)
@@ -510,10 +579,15 @@ class AutoTrader:
         for symbol in list(self.positions.positions.keys()):
             try:
                 price_data = get_current_price(symbol)
-                if not price_data:
+                if price_data:
+                    current_price = price_data["price"]
+                    self._last_prices[symbol] = current_price  # Cache for fallback
+                elif symbol in self._last_prices:
+                    current_price = self._last_prices[symbol]
+                    logger.warning(f"Price fetch failed for {symbol} — using last known ${current_price:.2f}")
+                else:
+                    logger.error(f"No price data for {symbol} and no cached price — skipping")
                     continue
-
-                current_price = price_data["price"]
 
                 # Get ATR for trailing stop calculation
                 from autotrader.data.indicators import calculate_indicators
@@ -534,6 +608,14 @@ class AutoTrader:
                     if action["action"] == "SELL_ALL":
                         logger.info(f"POSITION MGMT: {symbol} — {action['reason']}")
                         pnl = self._get_position_pnl(symbol, current_price)
+
+                        # Track R-multiple before removing position
+                        if symbol in self.positions.positions:
+                            pos = self.positions.positions[symbol]
+                            if pos.risk_per_share > 0:
+                                r_earned = (current_price - pos.entry_price) / pos.risk_per_share
+                                self._daily_r += r_earned
+
                         success = self.broker.close_position(symbol)
                         if success:
                             self.positions.remove_position(symbol)
@@ -555,12 +637,35 @@ class AutoTrader:
                         success = self.broker.sell_shares(symbol, qty)
                         if success:
                             logger.info(f"SCALE OUT {symbol}: sold {qty} shares")
+                            # Track proportional R for partial sell
+                            if symbol in self.positions.positions:
+                                pos = self.positions.positions[symbol]
+                                if pos.risk_per_share > 0:
+                                    r_per_share = (current_price - pos.entry_price) / pos.risk_per_share
+                                    proportion = qty / pos.quantity
+                                    self._daily_r += r_per_share * proportion
+                                # Update broker stop to match remaining shares
+                                if pos.broker_stop_order_id:
+                                    new_stop_id = self.broker.replace_stop_loss(
+                                        pos.broker_stop_order_id, symbol,
+                                        int(pos.shares_remaining), pos.current_stop,
+                                    )
+                                    pos.broker_stop_order_id = new_stop_id or ""
                         await self.telegram.send_message(
                             f"*Scale Out*: {symbol} — {qty} shares\n{action['reason']}"
                         )
 
                     elif action["action"] == "MOVE_STOP":
                         logger.info(f"POSITION MGMT: {symbol} — Stop → ${action['new_stop']:.2f}: {action['reason']}")
+                        # Update broker-side stop order to new level
+                        if symbol in self.positions.positions:
+                            pos = self.positions.positions[symbol]
+                            if pos.broker_stop_order_id:
+                                new_stop_id = self.broker.replace_stop_loss(
+                                    pos.broker_stop_order_id, symbol,
+                                    int(pos.shares_remaining), action["new_stop"],
+                                )
+                                pos.broker_stop_order_id = new_stop_id or ""
 
             except Exception as e:
                 logger.error(f"Position management error for {symbol}: {e}")
@@ -603,6 +708,12 @@ class AutoTrader:
                     take_profit=entry.take_profit,
                     pattern=entry.pattern,
                 )
+                # Place broker-side stop loss for crash protection
+                stop_id = self.broker.place_stop_loss(
+                    entry.symbol, int(entry.quantity), entry.stop_loss
+                )
+                if stop_id and entry.symbol in self.positions.positions:
+                    self.positions.positions[entry.symbol].broker_stop_order_id = stop_id
 
                 # Calculate how much better the entry was
                 # (compared to if we had bought at market when signal fired)
@@ -675,6 +786,15 @@ class AutoTrader:
         for pos in positions:
             symbol = pos.get("symbol")
             pnl = pos.get("unrealized_pnl", 0)
+            current_price = pos.get("current_price", 0)
+
+            # Track R-multiple before removing position
+            if symbol in self.positions.positions:
+                managed = self.positions.positions[symbol]
+                if managed.risk_per_share > 0 and current_price > 0:
+                    r_earned = (current_price - managed.entry_price) / managed.risk_per_share
+                    self._daily_r += r_earned
+
             self.broker.close_position(symbol)
             self.positions.remove_position(symbol)
 
@@ -720,6 +840,12 @@ class AutoTrader:
             session.commit()
 
             await self.telegram.send_daily_summary(portfolio, trades)
+
+            # Performance analytics — log running metrics
+            metrics = calculate_metrics()
+            if metrics.total_trades > 0:
+                logger.info(f"\n{format_metrics_for_log(metrics)}")
+
         except Exception as e:
             logger.error(f"Daily summary error: {e}")
             session.rollback()
@@ -736,9 +862,76 @@ class AutoTrader:
         logger.info("Daily summary complete. Shutting down until tomorrow.")
         await self.stop()
 
+    async def _weekly_performance_report(self):
+        """Friday EOD: send weekly performance analytics via Telegram."""
+        try:
+            metrics = calculate_metrics(days_back=7)
+            if metrics.total_trades == 0:
+                await self.telegram.send_message("*Weekly Report*\nNo trades this week.")
+                return
+
+            report = format_metrics_for_telegram(metrics)
+            await self.telegram.send_message(report)
+
+            # Also log the full report
+            full_report = format_metrics_for_log(metrics)
+            logger.info(f"Weekly performance report:\n{full_report}")
+
+            # Auto-adjustment: flag bad patterns
+            if metrics.patterns_to_avoid:
+                logger.warning(
+                    f"PATTERN ALERT: Consider removing these setups: "
+                    f"{', '.join(metrics.patterns_to_avoid)} "
+                    f"(win rate < 35% with negative R after 10+ trades)"
+                )
+                await self.telegram.send_message(
+                    f"*Pattern Alert*\n"
+                    f"Remove: {', '.join(metrics.patterns_to_avoid)}\n"
+                    f"(WR < 35% + negative R, 10+ trades)"
+                )
+        except Exception as e:
+            logger.error(f"Weekly report error: {e}")
+
     # ══════════════════════════════════════════════════════
     # HELPERS
     # ══════════════════════════════════════════════════════
+
+    async def _reconcile_broker_stops(self):
+        """On startup, verify all Alpaca positions have broker-side stop orders.
+        If any position is missing a stop, place one at 3% below current price."""
+        positions = self.broker.get_positions()
+        open_orders = self.broker.get_open_orders()
+
+        # Find which symbols already have stop orders
+        symbols_with_stops = set()
+        for order in open_orders:
+            if order.get("type") == "stop" and order.get("side") == "sell":
+                symbols_with_stops.add(order["symbol"])
+
+        for pos in positions:
+            symbol = pos["symbol"]
+            if symbol not in symbols_with_stops:
+                current_price = pos["current_price"]
+                qty = int(float(pos["qty"]))
+                default_stop = round(current_price * 0.97, 2)  # 3% below current
+
+                # If we have a managed position with a known stop, use that instead
+                if symbol in self.positions.positions:
+                    managed = self.positions.positions[symbol]
+                    default_stop = managed.current_stop
+
+                logger.warning(
+                    f"RECONCILE: {symbol} has no broker stop — placing at ${default_stop:.2f}"
+                )
+                stop_id = self.broker.place_stop_loss(symbol, qty, default_stop)
+                if stop_id and symbol in self.positions.positions:
+                    self.positions.positions[symbol].broker_stop_order_id = stop_id
+
+        if not positions:
+            logger.info("Reconcile: No open positions to check")
+        else:
+            logger.info(f"Reconcile: Checked {len(positions)} positions, "
+                        f"{len(positions) - len(symbols_with_stops & {p['symbol'] for p in positions})} needed stops")
 
     def _get_position_pnl(self, symbol: str, current_price: float) -> float:
         """Get unrealized P&L for a position."""
