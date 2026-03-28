@@ -30,15 +30,60 @@ SLIPPAGE_PER_SHARE = 0.02
 CLAUDE_CACHE_DIR = BASE_DIR / "data" / "claude_cache"
 CLAUDE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Default analysis times (ET) for each phase — used with --max-cycles-per-day
+
+def _tz_aware_timestamp(dt, index):
+    """Create a Timestamp compatible with a DataFrame's index timezone."""
+    ts = pd.Timestamp(dt.date() if hasattr(dt, 'date') else dt)
+    if hasattr(index, 'tz') and index.tz is not None:
+        ts = ts.tz_localize(index.tz)
+    return ts
+
+# Default analysis times (ET) — more frequent = more trade opportunities
 DEFAULT_ANALYSIS_TIMES = [
-    time(9, 35),   # Open (shortly after open, first ORB data)
-    time(10, 0),   # Prime start
+    time(9, 35),   # Open (ORB forming)
+    time(9, 50),   # Late open
+    time(10, 0),   # Prime start (10 AM reversal zone)
+    time(10, 15),  # Prime
     time(10, 30),  # Prime mid
-    time(11, 30),  # Lunch check
+    time(10, 45),  # Prime late
+    time(11, 15),  # Late morning
+    time(11, 45),  # Lunch
+    time(13, 0),   # Mid-day
     time(14, 0),   # Afternoon
-    time(15, 15),  # Power hour
+    time(14, 30),  # Afternoon mid
+    time(15, 0),   # Power hour start
+    time(15, 15),  # Power hour mid
+    time(15, 30),  # Power hour late
 ]
+
+# Backtest-specific risk parameters (more aggressive than live for discovery)
+BACKTEST_RISK = {
+    "max_risk_per_trade_pct": 0.20,       # 20% max ($20k on $100k) — scaled by confidence
+    "max_position_pct": 0.25,             # 25% max in one stock
+    "max_total_exposure_pct": 0.80,       # 80% deployed at once
+    "max_trades_per_day": 25,             # Room for 20+ trades
+    "min_risk_reward_ratio": 1.5,         # Slightly relaxed from 2:1
+    "min_confidence_to_trade": 0.50,      # Lower floor, confidence scaling handles the rest
+    "analyze_count": 15,                  # Symbols per cycle (up from 8)
+}
+
+
+def _confidence_risk_scale(confidence: float) -> float:
+    """Scale risk amount by confidence. Higher confidence = bigger bet.
+
+    0.50 confidence → 15% of max risk
+    0.60 confidence → 30% of max risk
+    0.70 confidence → 50% of max risk
+    0.80 confidence → 75% of max risk
+    0.90 confidence → 95% of max risk
+    1.00 confidence → 100% of max risk
+    """
+    # Quadratic scaling: starts small, ramps up fast at high confidence
+    # Clamp to [0.50, 1.0] range
+    c = max(0.50, min(1.0, confidence))
+    # Map 0.50-1.0 → 0.0-1.0, then square it and scale to 0.15-1.0
+    normalized = (c - 0.50) / 0.50
+    return 0.15 + 0.85 * (normalized ** 1.5)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -201,8 +246,8 @@ class BacktestEngine:
         end: str,
         starting_equity: float = 100_000.0,
         model: str = "claude-haiku-4-5-20251001",
-        max_cycles_per_day: int = 6,
-        max_trades_per_day: int = 8,
+        max_cycles_per_day: int = 14,
+        max_trades_per_day: int = 25,
     ):
         self.start_date = start
         self.end_date = end
@@ -457,7 +502,7 @@ class BacktestEngine:
                 self.cooldown_until = None
 
                 # Analyze top candidates
-                analyze_count = min(8, len(candidates))
+                analyze_count = min(BACKTEST_RISK["analyze_count"], len(candidates))
                 for sym in candidates[:analyze_count]:
                     if self.daily_trades >= self.max_trades_per_day:
                         break
@@ -478,11 +523,8 @@ class BacktestEngine:
                     daily = daily_bars.get(sym)
                     if daily is None or daily.empty:
                         continue
-                    daily_to_date = daily[daily.index < pd.Timestamp(day_dt.date())]
-                    if hasattr(daily_to_date.index, 'tz') and daily_to_date.index.tz:
-                        pass
-                    elif hasattr(daily.index, 'tz') and daily.index.tz:
-                        daily_to_date = daily[daily.index < pd.Timestamp(day_dt.date(), tz=daily.index.tz)]
+                    cutoff = _tz_aware_timestamp(day_dt, daily.index)
+                    daily_to_date = daily[daily.index < cutoff]
                     if len(daily_to_date) < 20:
                         continue
 
@@ -565,7 +607,7 @@ class BacktestEngine:
                     }
 
                     # Check total exposure
-                    if self.equity > 0 and total_position_value / self.equity >= RISK["max_total_exposure_pct"]:
+                    if self.equity > 0 and total_position_value / self.equity >= BACKTEST_RISK["max_total_exposure_pct"]:
                         continue
 
                     # Check sector concentration
@@ -604,20 +646,29 @@ class BacktestEngine:
                     stop_loss = float(stop_loss)
                     take_profit = float(take_profit)
 
-                    # Phase-specific confidence threshold
-                    min_conf = phase_config.get("min_confidence", RISK["min_confidence_to_trade"])
-                    if confidence < min_conf:
+                    # Confidence threshold
+                    if confidence < BACKTEST_RISK["min_confidence_to_trade"]:
                         continue
 
                     # R:R check with slippage
                     risk = abs(price - stop_loss) + SLIPPAGE_PER_SHARE * 2
                     reward = abs(take_profit - price) - SLIPPAGE_PER_SHARE * 2
-                    if risk <= 0 or reward <= 0 or reward / risk < RISK["min_risk_reward_ratio"]:
+                    if risk <= 0 or reward <= 0 or reward / risk < BACKTEST_RISK["min_risk_reward_ratio"]:
                         continue
 
-                    # Position sizing
-                    size_mult = phase_config.get("size_multiplier", 1.0)
-                    risk_amount = self.equity * RISK["max_risk_per_trade_pct"] * size_mult * regime_multiplier
+                    # Confidence-based position sizing
+                    # Max risk = 20% of equity ($20k on $100k), scaled by confidence
+                    conf_scale = _confidence_risk_scale(confidence)
+                    phase_mult = phase_config.get("size_multiplier", 1.0)
+                    # Ensure lunch/open still trade, just smaller
+                    phase_mult = max(phase_mult, 0.40)
+                    risk_amount = (
+                        self.equity
+                        * BACKTEST_RISK["max_risk_per_trade_pct"]
+                        * conf_scale
+                        * phase_mult
+                        * regime_multiplier
+                    )
 
                     stop_dist = abs(price - stop_loss) + SLIPPAGE_PER_SHARE * 2
                     if stop_dist <= 0:
@@ -628,7 +679,7 @@ class BacktestEngine:
                         continue
 
                     # Cap by max position and buying power
-                    max_shares = int(self.equity * RISK["max_position_pct"] / price)
+                    max_shares = int(self.equity * BACKTEST_RISK["max_position_pct"] / price)
                     max_by_cash = int(portfolio["cash"] / price)
                     shares = min(shares, max_shares, max_by_cash)
                     if shares <= 0:
@@ -1040,7 +1091,7 @@ JSON only:
                   "spy_price": 0, "spy_sma_50": 0, "vix_price": 18}
 
         if spy_daily is not None and not spy_daily.empty:
-            spy_to_date = spy_daily[spy_daily.index < pd.Timestamp(day_dt.date(), tz=spy_daily.index.tz) if hasattr(spy_daily.index, 'tz') and spy_daily.index.tz else pd.Timestamp(day_dt.date())]
+            spy_to_date = spy_daily[spy_daily.index < _tz_aware_timestamp(day_dt, spy_daily.index)]
             if len(spy_to_date) >= 50:
                 spy_price = float(spy_to_date["Close"].iloc[-1])
                 spy_sma_50 = float(spy_to_date["Close"].tail(50).mean())
@@ -1049,7 +1100,7 @@ JSON only:
                 regime["spy_trend"] = "bullish" if spy_price >= spy_sma_50 else "bearish"
 
         if vix_daily is not None and not vix_daily.empty:
-            vix_to_date = vix_daily[vix_daily.index < pd.Timestamp(day_dt.date(), tz=vix_daily.index.tz) if hasattr(vix_daily.index, 'tz') and vix_daily.index.tz else pd.Timestamp(day_dt.date())]
+            vix_to_date = vix_daily[vix_daily.index < _tz_aware_timestamp(day_dt, vix_daily.index)]
             if len(vix_to_date) >= 1:
                 vix_price = float(vix_to_date["Close"].iloc[-1])
                 regime["vix_price"] = vix_price
@@ -1122,7 +1173,7 @@ JSON only:
                 continue
 
             # Only use data up to prior day
-            to_date = daily[daily.index < pd.Timestamp(day_dt.date(), tz=daily.index.tz) if hasattr(daily.index, 'tz') and daily.index.tz else pd.Timestamp(day_dt.date())]
+            to_date = daily[daily.index < _tz_aware_timestamp(day_dt, daily.index)]
             if len(to_date) < 10:
                 continue
 

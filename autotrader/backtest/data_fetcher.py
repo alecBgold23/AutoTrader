@@ -18,6 +18,13 @@ CACHE_DIR = BASE_DIR / "data" / "backtest_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _read_cached_csv(path: Path) -> pd.DataFrame:
+    """Read a cached CSV with proper datetime index handling."""
+    df = pd.read_csv(path, index_col=0)
+    df.index = pd.to_datetime(df.index, utc=True)
+    return df
+
+
 def _get_alpaca_data_client():
     from alpaca.data.historical import StockHistoricalDataClient
     return StockHistoricalDataClient(
@@ -48,7 +55,7 @@ def fetch_5m_bars(
 
     if cache_file.exists() and not force_refresh:
         try:
-            df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            df = _read_cached_csv(cache_file)
             if not df.empty:
                 logger.debug(f"Cache hit: {symbol} {start_date} to {end_date} ({len(df)} bars)")
                 return df
@@ -141,7 +148,7 @@ def fetch_daily_bars(symbol: str, start_date: str, end_date: str) -> pd.DataFram
 
     if cache_file.exists():
         try:
-            df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            df = _read_cached_csv(cache_file)
             if not df.empty:
                 return df
         except Exception:
@@ -190,7 +197,7 @@ def fetch_vix_daily(start_date: str, end_date: str) -> pd.DataFrame:
     cache_file = CACHE_DIR / f"VIX_{start_date.replace('-', '')}_{end_date.replace('-', '')}_1d.csv"
     if cache_file.exists():
         try:
-            return pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            return _read_cached_csv(cache_file)
         except Exception:
             pass
 
