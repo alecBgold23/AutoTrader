@@ -246,7 +246,7 @@ class BacktestEngine:
         end: str,
         starting_equity: float = 100_000.0,
         model: str = "claude-haiku-4-5-20251001",
-        max_cycles_per_day: int = 14,
+        max_cycles_per_day: int = 8,
         max_trades_per_day: int = 25,
     ):
         self.start_date = start
@@ -999,7 +999,7 @@ class BacktestEngine:
         )
 
         try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=1)
             response = client.messages.create(
                 model=self.model,
                 max_tokens=CLAUDE_MAX_TOKENS,
@@ -1024,8 +1024,8 @@ class BacktestEngine:
             except Exception:
                 pass
 
-            # Rate limit (be gentle with API)
-            time_module.sleep(0.3)
+            # Rate limit — stay under Haiku's token-per-minute limit
+            time_module.sleep(1.5)
             return decision
 
         except json.JSONDecodeError as e:
