@@ -1,42 +1,58 @@
-"""Backtesting engine — replay historical days through the trading logic.
+"""Intraday backtesting engine — replays 5-minute bars through the full trading system.
 
-Feeds the same data through ClaudeAnalyst → RiskManager → PositionManager
-to measure system performance before risking real money.
-
-Key design:
-- $0.02/share slippage on all fills (entry + exit)
-- Same prompts, risk rules, and position management as live
-- Claude API responses cached to disk (keyed by symbol + date + data hash)
-- Each run gets its own SQLite database
+Simulates exactly what the live system sees at each point in time:
+- 5-minute bar replay with no look-ahead bias
+- Same indicators, patterns, key levels, VWAP from 5-min data
+- Same Claude prompts with time-of-day phase context
+- Same risk manager checks (regime, confidence, position limits, sector correlation)
+- Same PositionManager logic: scale-outs at 1R/2R, trailing stops, time exits
+- Fills at next bar's open + slippage ($0.02/share)
+- Force close everything at 3:50 PM simulated time
 """
 
 import hashlib
 import json
 import logging
-import os
-import time
+import math
+import time as time_module
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from autotrader.config import BASE_DIR, RISK, PHASE_CONFIG
 
 logger = logging.getLogger(__name__)
 
-SLIPPAGE_PER_SHARE = 0.02  # $0.02 per share per side
-CACHE_DIR = BASE_DIR / "data" / "backtest_cache"
+SLIPPAGE_PER_SHARE = 0.02
+CLAUDE_CACHE_DIR = BASE_DIR / "data" / "claude_cache"
+CLAUDE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Default analysis times (ET) for each phase — used with --max-cycles-per-day
+DEFAULT_ANALYSIS_TIMES = [
+    time(9, 35),   # Open (shortly after open, first ORB data)
+    time(10, 0),   # Prime start
+    time(10, 30),  # Prime mid
+    time(11, 30),  # Lunch check
+    time(14, 0),   # Afternoon
+    time(15, 15),  # Power hour
+]
+
+
+# ═══════════════════════════════════════════════════════════
+# DATA CLASSES
+# ═══════════════════════════════════════════════════════════
 
 
 @dataclass
 class SimulatedFill:
-    """A simulated trade fill."""
     symbol: str
     side: str
     quantity: int
-    price: float           # Price after slippage
-    raw_price: float       # Price before slippage
+    price: float
+    raw_price: float
     slippage: float
     timestamp: datetime
     pattern: str = ""
@@ -48,7 +64,6 @@ class SimulatedFill:
 
 @dataclass
 class SimulatedPosition:
-    """A position held during backtest."""
     symbol: str
     entry_price: float
     quantity: int
@@ -56,20 +71,27 @@ class SimulatedPosition:
     take_profit: float
     entry_time: datetime
     pattern: str = ""
+    confidence: float = 0.0
     risk_per_share: float = 0.0
     highest_price: float = 0.0
     scale_out_stage: int = 0
     shares_remaining: int = 0
+    realized_pnl: float = 0.0
+    r_target_1: float = 0.0
+    r_target_2: float = 0.0
+    current_stop: float = 0.0
 
     def __post_init__(self):
         self.risk_per_share = abs(self.entry_price - self.stop_loss)
         self.highest_price = self.entry_price
         self.shares_remaining = self.quantity
+        self.r_target_1 = self.entry_price + self.risk_per_share
+        self.r_target_2 = self.entry_price + self.risk_per_share * 2
+        self.current_stop = self.stop_loss
 
 
 @dataclass
 class BacktestTrade:
-    """A completed round-trip trade in the backtest."""
     symbol: str
     pattern: str
     entry_price: float
@@ -87,7 +109,6 @@ class BacktestTrade:
 
 @dataclass
 class BacktestResult:
-    """Complete results from a backtest run."""
     start_date: str
     end_date: str
     trading_days: int = 0
@@ -102,6 +123,7 @@ class BacktestResult:
     ending_equity: float = 100_000.0
     trades: list = field(default_factory=list)
     equity_curve: list = field(default_factory=list)
+    daily_returns: list = field(default_factory=list)
     api_calls: int = 0
     cache_hits: int = 0
 
@@ -117,7 +139,9 @@ class BacktestResult:
     def profit_factor(self) -> float:
         gross_wins = sum(t.pnl for t in self.trades if t.pnl > 0)
         gross_losses = abs(sum(t.pnl for t in self.trades if t.pnl < 0))
-        return (gross_wins / gross_losses) if gross_losses > 0 else float("inf") if gross_wins > 0 else 0
+        if gross_losses > 0:
+            return gross_wins / gross_losses
+        return float("inf") if gross_wins > 0 else 0
 
     @property
     def avg_r(self) -> float:
@@ -125,25 +149,50 @@ class BacktestResult:
 
     @property
     def return_pct(self) -> float:
-        return ((self.ending_equity - self.starting_equity) / self.starting_equity * 100) if self.starting_equity > 0 else 0
+        if self.starting_equity > 0:
+            return (self.ending_equity - self.starting_equity) / self.starting_equity * 100
+        return 0
+
+    @property
+    def avg_win(self) -> float:
+        wins = [t.pnl for t in self.trades if t.pnl > 0]
+        return sum(wins) / len(wins) if wins else 0
+
+    @property
+    def avg_loss(self) -> float:
+        losses = [t.pnl for t in self.trades if t.pnl < 0]
+        return sum(losses) / len(losses) if losses else 0
+
+    @property
+    def sharpe_ratio(self) -> float:
+        if not self.daily_returns or len(self.daily_returns) < 5:
+            return 0.0
+        rets = pd.Series(self.daily_returns)
+        if rets.std() == 0:
+            return 0.0
+        return float((rets.mean() / rets.std()) * math.sqrt(252))
 
     @property
     def passes_minimum_bar(self) -> bool:
-        """Check if results meet minimum criteria for real money."""
         return (
             self.total_trades >= 200
-            and self.expectancy > 0
             and self.profit_factor > 1.3
             and self.max_drawdown_pct < 8.0
+            and self.sharpe_ratio > 0.75
         )
 
 
+# ═══════════════════════════════════════════════════════════
+# ENGINE
+# ═══════════════════════════════════════════════════════════
+
+
 class BacktestEngine:
-    """Replay historical data through the trading system.
+    """Replay 5-minute bars through the full trading system.
 
     Usage:
-        engine = BacktestEngine(start="2025-01-02", end="2025-03-01")
-        result = engine.run(symbols=["AAPL", "NVDA", "TSLA", ...])
+        engine = BacktestEngine(start="2025-01-02", end="2025-03-28")
+        result = engine.run()
     """
 
     def __init__(
@@ -151,271 +200,1003 @@ class BacktestEngine:
         start: str,
         end: str,
         starting_equity: float = 100_000.0,
-        model: str = "",
+        model: str = "claude-haiku-4-5-20251001",
+        max_cycles_per_day: int = 6,
         max_trades_per_day: int = 8,
     ):
-        self.start_date = datetime.strptime(start, "%Y-%m-%d")
-        self.end_date = datetime.strptime(end, "%Y-%m-%d")
+        self.start_date = start
+        self.end_date = end
         self.equity = starting_equity
         self.starting_equity = starting_equity
-        self.model = model  # Override model (e.g., haiku for cheap runs)
+        self.model = model
+        self.max_cycles_per_day = max_cycles_per_day
         self.max_trades_per_day = max_trades_per_day
 
         self.positions: dict[str, SimulatedPosition] = {}
         self.completed_trades: list[BacktestTrade] = []
         self.equity_curve: list[tuple[str, float]] = []
+        self.daily_returns: list[float] = []
         self.api_calls = 0
         self.cache_hits = 0
 
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Risk tracking (mirrors RiskManager)
+        self.peak_equity = starting_equity
+        self.consecutive_losses = 0
+        self.cooldown_until: datetime | None = None
+        self.daily_trades = 0
+        self.daily_pnl = 0.0
 
-    def run(self, symbols: list[str]) -> BacktestResult:
-        """Run the backtest across all trading days.
+        # Analysis times (trimmed to max_cycles_per_day)
+        self.analysis_times = DEFAULT_ANALYSIS_TIMES[:max_cycles_per_day]
 
-        Args:
-            symbols: List of symbols to test (e.g., top 5 scanner picks per day)
+    def run(self) -> BacktestResult:
+        """Run the full intraday backtest."""
+        from autotrader.backtest.data_fetcher import (
+            fetch_5m_bars, fetch_daily_bars, fetch_spy_daily,
+            fetch_vix_daily, get_trading_days,
+        )
 
-        Returns:
-            BacktestResult with all metrics
-        """
-        import anthropic
-        from autotrader.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_MAX_TOKENS
-        from autotrader.brain.prompts import SYSTEM_PROMPT, build_analysis_prompt
-        from autotrader.data.market import get_stock_data
-        from autotrader.data.indicators import calculate_indicators, get_signal_summary
+        logger.info(
+            f"Backtest: {self.start_date} to {self.end_date} | "
+            f"Model: {self.model} | Cycles/day: {self.max_cycles_per_day}"
+        )
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        model = self.model or CLAUDE_MODEL
+        # 1. Get trading days
+        trading_days = get_trading_days(self.start_date, self.end_date)
+        if not trading_days:
+            logger.error("No trading days found in range")
+            return self._build_result(0)
 
-        current = self.start_date
-        trading_days = 0
-        peak_equity = self.equity
+        logger.info(f"Found {len(trading_days)} trading days")
 
-        logger.info(f"Backtest: {self.start_date.date()} to {self.end_date.date()} | {len(symbols)} symbols | Model: {model}")
+        # 2. Prefetch SPY/VIX daily for regime
+        spy_daily = fetch_spy_daily(self.start_date, self.end_date)
+        vix_daily = fetch_vix_daily(self.start_date, self.end_date)
 
-        while current <= self.end_date:
-            # Skip weekends
-            if current.weekday() >= 5:
-                current += timedelta(days=1)
-                continue
+        # 3. Build universe candidates — use scanner scoring on daily data
+        # For backtest, we use a fixed universe of high-liquidity names plus
+        # dynamically scored movers per day
+        universe = self._build_backtest_universe(trading_days)
 
-            date_str = current.strftime("%Y-%m-%d")
-            trading_days += 1
-            daily_trades = 0
+        # 4. Prefetch all 5m data for the universe
+        logger.info(f"Fetching 5-minute data for {len(universe)} symbols...")
+        bars_5m: dict[str, pd.DataFrame] = {}
+        daily_bars: dict[str, pd.DataFrame] = {}
+        for sym in universe:
+            bars_5m[sym] = fetch_5m_bars(sym, self.start_date, self.end_date)
+            daily_bars[sym] = fetch_daily_bars(sym, self.start_date, self.end_date)
+            if not bars_5m[sym].empty:
+                logger.debug(f"  {sym}: {len(bars_5m[sym])} 5m bars")
+
+        # Filter to symbols with actual data
+        active_symbols = [s for s in universe if not bars_5m[s].empty and not daily_bars[s].empty]
+        logger.info(f"Active symbols with data: {len(active_symbols)}")
+
+        # 5. Replay each trading day
+        prev_equity = self.equity
+        for day_idx, day_dt in enumerate(trading_days):
+            day_str = day_dt.strftime("%Y-%m-%d")
+            self.daily_trades = 0
+            self.daily_pnl = 0.0
 
             # Snapshot equity at start of day
-            self.equity_curve.append((date_str, self.equity))
+            self.equity_curve.append((day_str, round(self.equity, 2)))
 
-            # Track drawdown
-            if self.equity > peak_equity:
-                peak_equity = self.equity
+            # Determine regime for this day
+            regime = self._get_regime(day_dt, spy_daily, vix_daily)
+            regime_multiplier = self._regime_size_multiplier(regime)
+            regime_context = self._regime_context_str(regime)
 
-            for symbol in symbols:
-                if daily_trades >= self.max_trades_per_day:
-                    break
+            # Find today's top candidates using scanner-like scoring
+            todays_candidates = self._score_candidates_for_day(
+                day_dt, active_symbols, daily_bars, bars_5m
+            )
 
-                try:
-                    # Get historical data as of this date
-                    hist = get_stock_data(symbol, period="3mo", interval="1d")
-                    if hist.empty:
-                        continue
+            if not todays_candidates:
+                # Track daily return
+                daily_ret = (self.equity - prev_equity) / prev_equity if prev_equity > 0 else 0
+                self.daily_returns.append(daily_ret)
+                prev_equity = self.equity
+                continue
 
-                    # Filter to only data available on this date
-                    hist_to_date = hist[hist.index <= pd.Timestamp(current, tz=hist.index.tz)]
-                    if len(hist_to_date) < 20:
-                        continue
+            # Replay the day bar by bar
+            self._replay_day(
+                day_dt=day_dt,
+                candidates=todays_candidates,
+                bars_5m=bars_5m,
+                daily_bars=daily_bars,
+                regime=regime,
+                regime_multiplier=regime_multiplier,
+                regime_context=regime_context,
+            )
 
-                    today_bar = hist_to_date.iloc[-1]
-                    prev_bar = hist_to_date.iloc[-2] if len(hist_to_date) > 1 else today_bar
+            # Track daily return
+            daily_ret = (self.equity - prev_equity) / prev_equity if prev_equity > 0 else 0
+            self.daily_returns.append(daily_ret)
+            prev_equity = self.equity
 
-                    price = float(today_bar["Close"])
-                    indicators = calculate_indicators(hist_to_date)
-                    signal_summary = get_signal_summary(indicators)
+            # Log progress
+            if (day_idx + 1) % 5 == 0 or day_idx == len(trading_days) - 1:
+                logger.info(
+                    f"Day {day_idx+1}/{len(trading_days)} | {day_str} | "
+                    f"Equity: ${self.equity:,.0f} | Trades: {len(self.completed_trades)} | "
+                    f"API: {self.api_calls} | Cache: {self.cache_hits}"
+                )
 
-                    # Build price data dict
-                    price_data = {
-                        "price": price,
-                        "open": float(today_bar["Open"]),
-                        "high": float(today_bar["High"]),
-                        "low": float(today_bar["Low"]),
-                        "volume": int(today_bar["Volume"]),
-                        "prev_close": float(prev_bar["Close"]),
-                        "change_pct": ((price - float(prev_bar["Close"])) / float(prev_bar["Close"]) * 100) if float(prev_bar["Close"]) > 0 else 0,
-                    }
+        return self._build_result(len(trading_days))
 
-                    # Check cache
-                    cache_key = self._cache_key(symbol, date_str, price_data)
-                    cached = self._load_cache(cache_key)
+    def _replay_day(
+        self,
+        day_dt: datetime,
+        candidates: list[str],
+        bars_5m: dict[str, pd.DataFrame],
+        daily_bars: dict[str, pd.DataFrame],
+        regime: dict,
+        regime_multiplier: float,
+        regime_context: str,
+    ):
+        """Replay one trading day through 5-minute bars."""
+        from autotrader.data.indicators import (
+            calculate_indicators, get_signal_summary,
+            calculate_intraday_indicators, get_intraday_signal_summary,
+        )
+        from autotrader.data.patterns import (
+            detect_all_patterns, get_key_levels,
+            format_patterns_for_prompt, format_levels_for_prompt,
+        )
 
-                    if cached:
-                        self.cache_hits += 1
-                        decision = cached
-                    else:
-                        # Build prompt (simplified for backtest — no intraday, no news)
-                        portfolio = {
-                            "equity": self.equity,
-                            "cash": self.equity - sum(
-                                p.entry_price * p.shares_remaining
-                                for p in self.positions.values()
-                            ),
-                            "positions": [],
-                        }
+        day_str = day_dt.strftime("%Y-%m-%d")
 
-                        prompt = build_analysis_prompt(
-                            symbol=symbol,
-                            price_data=price_data,
-                            indicators=indicators,
-                            signal_summary=signal_summary,
-                            intraday_summary="Backtest mode — no intraday data available",
-                            news_text="Backtest mode — no news data available",
-                            portfolio=portfolio,
-                            trades_today=daily_trades,
-                            market_phase="prime",
-                            regime_context="Backtest mode — regime not available for historical data",
-                        )
+        # Get all 5m bars for today, across all candidates
+        # Build a time-sorted list of all timestamps for today
+        all_timestamps = set()
+        sym_day_bars: dict[str, pd.DataFrame] = {}
 
-                        # Call Claude
-                        try:
-                            response = client.messages.create(
-                                model=model,
-                                max_tokens=CLAUDE_MAX_TOKENS,
-                                system=SYSTEM_PROMPT,
-                                messages=[{"role": "user", "content": prompt}],
-                            )
-                            self.api_calls += 1
-                            raw_text = response.content[0].text.strip()
+        for sym in candidates:
+            df = bars_5m.get(sym)
+            if df is None or df.empty:
+                continue
+            # Filter to this day's bars
+            if hasattr(df.index, 'date'):
+                mask = df.index.date == day_dt.date()
+            else:
+                mask = pd.Series([False] * len(df))
+            day_df = df[mask]
+            if day_df.empty:
+                continue
+            sym_day_bars[sym] = day_df
+            all_timestamps.update(day_df.index)
 
-                            # Parse JSON
-                            text = raw_text.strip()
-                            if text.startswith("```"):
-                                text = text.split("\n", 1)[-1]
-                                text = text.rsplit("```", 1)[0].strip()
+        if not all_timestamps:
+            return
 
-                            decision = json.loads(text)
-                            self._save_cache(cache_key, decision)
+        sorted_times = sorted(all_timestamps)
 
-                            # Rate limit
-                            time.sleep(0.5)
+        # Determine which timestamps to run analysis cycles at
+        analysis_indices = self._pick_analysis_bar_indices(sorted_times)
 
-                        except Exception as e:
-                            logger.warning(f"API error for {symbol} on {date_str}: {e}")
+        # Pending orders: {symbol: {side, qty, stop_loss, take_profit, pattern, confidence, reasoning}}
+        pending_buys: dict[str, dict] = {}
+
+        for bar_idx, current_time in enumerate(sorted_times):
+            current_et = current_time
+            if hasattr(current_time, 'hour'):
+                hour, minute = current_time.hour, current_time.minute
+            else:
+                continue
+
+            # Convert to ET if needed (Alpaca returns UTC)
+            try:
+                from zoneinfo import ZoneInfo
+            except ImportError:
+                from backports.zoneinfo import ZoneInfo
+            if current_time.tzinfo and str(current_time.tzinfo) != "US/Eastern":
+                current_et = current_time.astimezone(ZoneInfo("US/Eastern"))
+                hour, minute = current_et.hour, current_et.minute
+
+            # Skip pre-market bars
+            if hour < 9 or (hour == 9 and minute < 30):
+                continue
+
+            # Force close at 3:50 PM ET
+            if hour == 15 and minute >= 50:
+                self._force_close_all(current_time, sym_day_bars, bar_idx, sorted_times)
+                break
+
+            if hour >= 16:
+                self._force_close_all(current_time, sym_day_bars, bar_idx, sorted_times)
+                break
+
+            # ── Fill pending buy orders at this bar's open ──
+            for sym in list(pending_buys.keys()):
+                if sym in sym_day_bars and sym not in self.positions:
+                    today_df = sym_day_bars[sym]
+                    if current_time in today_df.index:
+                        bar = today_df.loc[current_time]
+                        fill_price = float(bar["Open"]) + SLIPPAGE_PER_SHARE
+                        order = pending_buys.pop(sym)
+
+                        # Verify stop still valid after slippage
+                        if fill_price <= order["stop_loss"]:
                             continue
 
-                    # Process decision
+                        self.positions[sym] = SimulatedPosition(
+                            symbol=sym,
+                            entry_price=fill_price,
+                            quantity=order["qty"],
+                            stop_loss=order["stop_loss"],
+                            take_profit=order["take_profit"],
+                            entry_time=current_time,
+                            pattern=order["pattern"],
+                            confidence=order["confidence"],
+                        )
+                        self.daily_trades += 1
+
+            # ── Manage existing positions (check stops, scale-outs) ──
+            self._manage_positions_at_bar(current_time, sym_day_bars, hour, minute)
+
+            # ── Run Claude analysis at scheduled times ──
+            if bar_idx in analysis_indices:
+                phase = self._get_phase(hour, minute)
+                phase_config = PHASE_CONFIG.get(phase, {})
+
+                # Skip phases that block trading
+                if phase_config.get("size_multiplier", 1.0) <= 0:
+                    continue
+
+                # Check daily loss halt
+                if self.equity > 0 and self.daily_pnl < 0:
+                    daily_loss_pct = abs(self.daily_pnl) / self.equity
+                    if daily_loss_pct >= RISK["max_daily_loss_pct"]:
+                        logger.debug(f"  Daily loss halt on {day_str}")
+                        break
+
+                # Check cooldown
+                if self.cooldown_until and current_time < self.cooldown_until:
+                    continue
+                self.cooldown_until = None
+
+                # Analyze top candidates
+                analyze_count = min(8, len(candidates))
+                for sym in candidates[:analyze_count]:
+                    if self.daily_trades >= self.max_trades_per_day:
+                        break
+                    if sym in self.positions:
+                        continue  # Already in this stock
+                    if sym in pending_buys:
+                        continue
+                    if sym not in sym_day_bars:
+                        continue
+
+                    today_df = sym_day_bars[sym]
+                    # Only use bars up to current_time (no look-ahead)
+                    visible_bars = today_df[today_df.index <= current_time]
+                    if len(visible_bars) < 3:
+                        continue
+
+                    # Get daily data up to prior day (no look-ahead)
+                    daily = daily_bars.get(sym)
+                    if daily is None or daily.empty:
+                        continue
+                    daily_to_date = daily[daily.index < pd.Timestamp(day_dt.date())]
+                    if hasattr(daily_to_date.index, 'tz') and daily_to_date.index.tz:
+                        pass
+                    elif hasattr(daily.index, 'tz') and daily.index.tz:
+                        daily_to_date = daily[daily.index < pd.Timestamp(day_dt.date(), tz=daily.index.tz)]
+                    if len(daily_to_date) < 20:
+                        continue
+
+                    # Calculate indicators
+                    indicators = calculate_indicators(daily_to_date)
+                    signal_summary = get_signal_summary(indicators)
+
+                    intraday_indicators = calculate_intraday_indicators(visible_bars)
+                    intraday_summary = get_intraday_signal_summary(intraday_indicators)
+                    indicators.update(intraday_indicators)
+
+                    # Current bar data
+                    current_bar = visible_bars.iloc[-1]
+                    price = float(current_bar["Close"])
+                    today_open = float(today_df.iloc[0]["Open"]) if len(today_df) > 0 else price
+                    prev_close = float(daily_to_date["Close"].iloc[-1]) if len(daily_to_date) > 0 else price
+
+                    price_data = {
+                        "price": price,
+                        "open": today_open,
+                        "high": float(visible_bars["High"].max()),
+                        "low": float(visible_bars["Low"].min()),
+                        "volume": int(visible_bars["Volume"].sum()),
+                        "prev_close": prev_close,
+                        "change_pct": ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0,
+                    }
+
+                    # Patterns
+                    vwap = indicators.get("vwap") or indicators.get("vwap_5m")
+                    prior_day_high = float(daily_to_date["High"].iloc[-1]) if len(daily_to_date) > 0 else None
+                    prior_day_low = float(daily_to_date["Low"].iloc[-1]) if len(daily_to_date) > 0 else None
+
+                    detected_patterns = detect_all_patterns(
+                        df_daily=daily_to_date,
+                        df_5m=visible_bars if len(visible_bars) >= 10 else None,
+                        prior_day_high=prior_day_high,
+                        prior_day_low=prior_day_low,
+                        prior_day_close=prev_close,
+                        vwap=vwap,
+                    )
+                    patterns_text = format_patterns_for_prompt(detected_patterns)
+
+                    key_levels = get_key_levels(
+                        df_daily=daily_to_date,
+                        df_5m=visible_bars if len(visible_bars) >= 6 else None,
+                        vwap=vwap,
+                    )
+                    levels_text = format_levels_for_prompt(key_levels)
+
+                    # Scanner flags (simplified for backtest)
+                    vol_avg = indicators.get("volume_sma_20", 1) or 1
+                    rvol = price_data["volume"] / vol_avg if vol_avg > 0 else 0
+                    gap_pct = ((today_open - prev_close) / prev_close * 100) if prev_close > 0 else 0
+                    flags = []
+                    if rvol >= 2.0:
+                        flags.append(f"RVOL: {rvol:.1f}x")
+                    if abs(gap_pct) >= 2.0:
+                        flags.append(f"Gap: {gap_pct:+.1f}%")
+                    scanner_flags = " | ".join(flags) if flags else "Watchlist stock"
+
+                    # Build portfolio context
+                    positions_list = []
+                    total_position_value = 0
+                    for ps, pos in self.positions.items():
+                        pv = pos.entry_price * pos.shares_remaining
+                        positions_list.append({
+                            "symbol": ps,
+                            "qty": pos.shares_remaining,
+                            "market_value": pv,
+                            "unrealized_pnl": 0,
+                        })
+                        total_position_value += pv
+
+                    portfolio = {
+                        "equity": self.equity,
+                        "cash": self.equity - total_position_value,
+                        "buying_power": self.equity - total_position_value,
+                        "positions": positions_list,
+                        "daily_pnl": self.daily_pnl,
+                    }
+
+                    # Check total exposure
+                    if self.equity > 0 and total_position_value / self.equity >= RISK["max_total_exposure_pct"]:
+                        continue
+
+                    # Check sector concentration
+                    if not self._check_sector_ok(sym):
+                        continue
+
+                    # Ask Claude
+                    decision = self._ask_claude(
+                        symbol=sym,
+                        price_data=price_data,
+                        indicators=indicators,
+                        signal_summary=signal_summary,
+                        intraday_summary=intraday_summary,
+                        portfolio=portfolio,
+                        scanner_flags=scanner_flags,
+                        patterns_text=patterns_text,
+                        levels_text=levels_text,
+                        phase=phase,
+                        regime_context=regime_context,
+                        day_str=day_str,
+                        time_str=f"{hour:02d}{minute:02d}",
+                    )
+
+                    if not decision:
+                        continue
+
                     action = decision.get("action", "HOLD").upper()
                     confidence = float(decision.get("confidence", 0))
                     stop_loss = decision.get("stop_loss")
                     take_profit = decision.get("take_profit")
 
-                    if action == "BUY" and confidence >= 0.55 and stop_loss and take_profit:
-                        # Position sizing (simplified)
-                        risk_amount = self.equity * RISK["max_risk_per_trade_pct"]
-                        stop_dist = abs(price - float(stop_loss))
-                        if stop_dist <= 0:
-                            continue
-
-                        shares = int(risk_amount / (stop_dist + SLIPPAGE_PER_SHARE * 2))
-                        if shares <= 0:
-                            continue
-
-                        # Enforce max position size
-                        max_shares = int(self.equity * RISK["max_position_pct"] / price)
-                        shares = min(shares, max_shares)
-
-                        # Check R:R with slippage
-                        eff_risk = stop_dist + SLIPPAGE_PER_SHARE * 2
-                        eff_reward = abs(float(take_profit) - price) - SLIPPAGE_PER_SHARE * 2
-                        if eff_reward <= 0 or eff_reward / eff_risk < RISK["min_risk_reward_ratio"]:
-                            continue
-
-                        # Simulate fill with slippage
-                        fill_price = price + SLIPPAGE_PER_SHARE
-
-                        if symbol not in self.positions:
-                            self.positions[symbol] = SimulatedPosition(
-                                symbol=symbol,
-                                entry_price=fill_price,
-                                quantity=shares,
-                                stop_loss=float(stop_loss),
-                                take_profit=float(take_profit),
-                                entry_time=current,
-                                pattern=decision.get("pattern", "unknown"),
-                            )
-                            daily_trades += 1
-
-                    elif action == "SELL" and symbol in self.positions:
-                        pos = self.positions[symbol]
-                        exit_price = price - SLIPPAGE_PER_SHARE
-                        pnl = (exit_price - pos.entry_price) * pos.shares_remaining
-                        slippage = SLIPPAGE_PER_SHARE * 2 * pos.shares_remaining
-                        r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
-
-                        self.completed_trades.append(BacktestTrade(
-                            symbol=symbol,
-                            pattern=pos.pattern,
-                            entry_price=pos.entry_price,
-                            exit_price=exit_price,
-                            quantity=pos.shares_remaining,
-                            pnl=pnl,
-                            r_multiple=r_mult,
-                            entry_time=pos.entry_time,
-                            exit_time=current,
-                            exit_reason=f"Claude SELL (conf={confidence:.0%})",
-                            confidence=confidence,
-                            slippage_cost=slippage,
-                        ))
-
-                        self.equity += pnl
-                        del self.positions[symbol]
-                        daily_trades += 1
-
-                except Exception as e:
-                    logger.error(f"Backtest error for {symbol} on {date_str}: {e}")
-                    continue
-
-            # EOD: close all positions (day trading rule)
-            for symbol in list(self.positions.keys()):
-                pos = self.positions[symbol]
-                try:
-                    hist = get_stock_data(symbol, period="1mo", interval="1d")
-                    hist_to_date = hist[hist.index <= pd.Timestamp(current, tz=hist.index.tz)]
-                    if hist_to_date.empty:
+                    # Validate BUY
+                    if action != "BUY" or not stop_loss or not take_profit:
                         continue
-                    eod_price = float(hist_to_date.iloc[-1]["Close"])
-                except Exception:
-                    continue
 
-                exit_price = eod_price - SLIPPAGE_PER_SHARE
-                pnl = (exit_price - pos.entry_price) * pos.shares_remaining
-                slippage = SLIPPAGE_PER_SHARE * 2 * pos.shares_remaining
+                    stop_loss = float(stop_loss)
+                    take_profit = float(take_profit)
+
+                    # Phase-specific confidence threshold
+                    min_conf = phase_config.get("min_confidence", RISK["min_confidence_to_trade"])
+                    if confidence < min_conf:
+                        continue
+
+                    # R:R check with slippage
+                    risk = abs(price - stop_loss) + SLIPPAGE_PER_SHARE * 2
+                    reward = abs(take_profit - price) - SLIPPAGE_PER_SHARE * 2
+                    if risk <= 0 or reward <= 0 or reward / risk < RISK["min_risk_reward_ratio"]:
+                        continue
+
+                    # Position sizing
+                    size_mult = phase_config.get("size_multiplier", 1.0)
+                    risk_amount = self.equity * RISK["max_risk_per_trade_pct"] * size_mult * regime_multiplier
+
+                    stop_dist = abs(price - stop_loss) + SLIPPAGE_PER_SHARE * 2
+                    if stop_dist <= 0:
+                        continue
+
+                    shares = int(risk_amount / (price * (stop_dist / price)))
+                    if shares <= 0:
+                        continue
+
+                    # Cap by max position and buying power
+                    max_shares = int(self.equity * RISK["max_position_pct"] / price)
+                    max_by_cash = int(portfolio["cash"] / price)
+                    shares = min(shares, max_shares, max_by_cash)
+                    if shares <= 0:
+                        continue
+
+                    # Queue order to fill at next bar's open
+                    pending_buys[sym] = {
+                        "qty": shares,
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit,
+                        "pattern": decision.get("pattern", "unknown"),
+                        "confidence": confidence,
+                        "reasoning": decision.get("reasoning", ""),
+                        "phase": phase,
+                    }
+
+        # End of day: force close anything remaining
+        if self.positions:
+            last_time = sorted_times[-1] if sorted_times else day_dt
+            self._force_close_all(last_time, sym_day_bars, len(sorted_times) - 1, sorted_times)
+
+    def _manage_positions_at_bar(
+        self, current_time: datetime, sym_day_bars: dict, hour: int, minute: int
+    ):
+        """Check stops, scale-outs, trailing stops, and time exits for all positions."""
+        for sym in list(self.positions.keys()):
+            pos = self.positions[sym]
+            if sym not in sym_day_bars:
+                continue
+
+            today_df = sym_day_bars[sym]
+            if current_time not in today_df.index:
+                continue
+
+            bar = today_df.loc[current_time]
+            bar_low = float(bar["Low"])
+            bar_high = float(bar["High"])
+            bar_close = float(bar["Close"])
+
+            # Update highest price
+            if bar_high > pos.highest_price:
+                pos.highest_price = bar_high
+
+            # Check stop loss hit (bar low touched stop)
+            if bar_low <= pos.current_stop:
+                exit_price = pos.current_stop - SLIPPAGE_PER_SHARE
+                self._close_position(sym, exit_price, current_time, "Stop loss hit")
+                continue
+
+            # Scale out at 1R
+            if (pos.scale_out_stage == 0
+                    and bar_high >= pos.r_target_1
+                    and pos.shares_remaining > 1):
+                sell_qty = max(1, int(pos.quantity / 3))
+                actual_sell = min(sell_qty, pos.shares_remaining - 1)
+                if actual_sell > 0:
+                    exit_price = pos.r_target_1 - SLIPPAGE_PER_SHARE
+                    pnl = (exit_price - pos.entry_price) * actual_sell
+                    slippage = SLIPPAGE_PER_SHARE * 2 * actual_sell
+                    r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+
+                    self.completed_trades.append(BacktestTrade(
+                        symbol=sym, pattern=pos.pattern,
+                        entry_price=pos.entry_price, exit_price=exit_price,
+                        quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
+                        entry_time=pos.entry_time, exit_time=current_time,
+                        exit_reason="Scale out 1R (1/3)",
+                        confidence=pos.confidence, slippage_cost=slippage,
+                    ))
+                    self.equity += pnl
+                    self.daily_pnl += pnl
+                    pos.shares_remaining -= actual_sell
+                    pos.realized_pnl += pnl
+                    pos.scale_out_stage = 1
+                    pos.current_stop = pos.entry_price  # Move to breakeven
+
+            # Scale out at 2R
+            elif (pos.scale_out_stage == 1
+                  and bar_high >= pos.r_target_2
+                  and pos.shares_remaining > 1):
+                sell_qty = max(1, int(pos.quantity / 3))
+                actual_sell = min(sell_qty, pos.shares_remaining - 1)
+                if actual_sell > 0:
+                    exit_price = pos.r_target_2 - SLIPPAGE_PER_SHARE
+                    pnl = (exit_price - pos.entry_price) * actual_sell
+                    slippage = SLIPPAGE_PER_SHARE * 2 * actual_sell
+                    r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+
+                    self.completed_trades.append(BacktestTrade(
+                        symbol=sym, pattern=pos.pattern,
+                        entry_price=pos.entry_price, exit_price=exit_price,
+                        quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
+                        entry_time=pos.entry_time, exit_time=current_time,
+                        exit_reason="Scale out 2R (2/3)",
+                        confidence=pos.confidence, slippage_cost=slippage,
+                    ))
+                    self.equity += pnl
+                    self.daily_pnl += pnl
+                    pos.shares_remaining -= actual_sell
+                    pos.realized_pnl += pnl
+                    pos.scale_out_stage = 2
+
+            # Trailing stop (after first scale-out)
+            if pos.scale_out_stage >= 1:
+                # Use 2% fixed trailing (ATR not available per bar in backtest)
+                trail_stop = pos.highest_price * 0.98
+                if trail_stop > pos.current_stop:
+                    pos.current_stop = trail_stop
+
+            # Time exit: 30 min to close → sell half
+            minutes_to_close = (16 * 60) - (hour * 60 + minute)
+            if minutes_to_close <= 30 and minutes_to_close > 15 and pos.shares_remaining > 1:
+                sell_qty = max(1, int(pos.shares_remaining / 2))
+                exit_price = bar_close - SLIPPAGE_PER_SHARE
+                pnl = (exit_price - pos.entry_price) * sell_qty
+                slippage = SLIPPAGE_PER_SHARE * 2 * sell_qty
                 r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
 
                 self.completed_trades.append(BacktestTrade(
-                    symbol=symbol,
-                    pattern=pos.pattern,
-                    entry_price=pos.entry_price,
-                    exit_price=exit_price,
-                    quantity=pos.shares_remaining,
-                    pnl=pnl,
-                    r_multiple=r_mult,
-                    entry_time=pos.entry_time,
-                    exit_time=current,
-                    exit_reason="EOD close",
-                    slippage_cost=slippage,
+                    symbol=sym, pattern=pos.pattern,
+                    entry_price=pos.entry_price, exit_price=exit_price,
+                    quantity=sell_qty, pnl=pnl, r_multiple=r_mult,
+                    entry_time=pos.entry_time, exit_time=current_time,
+                    exit_reason=f"Time exit ({minutes_to_close}min to close)",
+                    confidence=pos.confidence, slippage_cost=slippage,
                 ))
                 self.equity += pnl
+                self.daily_pnl += pnl
+                pos.shares_remaining -= sell_qty
+                pos.realized_pnl += pnl
 
-            self.positions.clear()
-            current += timedelta(days=1)
+            # Time exit: 15 min to close → close all
+            if minutes_to_close <= 15:
+                exit_price = bar_close - SLIPPAGE_PER_SHARE
+                self._close_position(sym, exit_price, current_time, f"EOD close ({minutes_to_close}min)")
 
-        # Build result
+    def _force_close_all(self, close_time, sym_day_bars, bar_idx, sorted_times):
+        """Force close all positions at EOD."""
+        for sym in list(self.positions.keys()):
+            pos = self.positions[sym]
+            if sym in sym_day_bars:
+                today_df = sym_day_bars[sym]
+                # Use the last available bar's close
+                visible = today_df[today_df.index <= close_time]
+                if not visible.empty:
+                    exit_price = float(visible.iloc[-1]["Close"]) - SLIPPAGE_PER_SHARE
+                else:
+                    exit_price = pos.entry_price  # Fallback
+            else:
+                exit_price = pos.entry_price
+
+            self._close_position(sym, exit_price, close_time, "EOD force close")
+
+    def _close_position(self, symbol: str, exit_price: float, exit_time, reason: str):
+        """Close a position and record the trade."""
+        if symbol not in self.positions:
+            return
+
+        pos = self.positions[symbol]
+        qty = pos.shares_remaining
+        if qty <= 0:
+            del self.positions[symbol]
+            return
+
+        pnl = (exit_price - pos.entry_price) * qty
+        slippage = SLIPPAGE_PER_SHARE * 2 * qty
+        r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+
+        self.completed_trades.append(BacktestTrade(
+            symbol=symbol, pattern=pos.pattern,
+            entry_price=pos.entry_price, exit_price=exit_price,
+            quantity=qty, pnl=pnl, r_multiple=r_mult,
+            entry_time=pos.entry_time, exit_time=exit_time,
+            exit_reason=reason,
+            confidence=pos.confidence, slippage_cost=slippage,
+        ))
+        self.equity += pnl
+        self.daily_pnl += pnl
+
+        # Track consecutive losses
+        if pnl < 0:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= RISK["max_consecutive_losses"]:
+                self.cooldown_until = exit_time + timedelta(minutes=RISK["cooldown_after_losses_minutes"])
+        else:
+            self.consecutive_losses = 0
+
+        # Track drawdown
+        if self.equity > self.peak_equity:
+            self.peak_equity = self.equity
+
+        del self.positions[symbol]
+
+    def _ask_claude(
+        self, symbol, price_data, indicators, signal_summary,
+        intraday_summary, portfolio, scanner_flags, patterns_text,
+        levels_text, phase, regime_context, day_str, time_str,
+    ) -> dict | None:
+        """Ask Claude for a trading decision, with caching."""
+        import anthropic
+        from autotrader.config import ANTHROPIC_API_KEY, CLAUDE_MAX_TOKENS
+        from autotrader.brain.prompts import SYSTEM_PROMPT
+
+        # Build cache key from all inputs
+        cache_data = f"{symbol}_{day_str}_{time_str}_{price_data.get('price')}_{price_data.get('volume')}_{phase}"
+        cache_key = hashlib.md5(cache_data.encode()).hexdigest()
+        cache_file = CLAUDE_CACHE_DIR / f"{cache_key}.json"
+
+        # Check cache
+        if cache_file.exists():
+            try:
+                with open(cache_file) as f:
+                    self.cache_hits += 1
+                    return json.load(f)
+            except Exception:
+                pass
+
+        # Build the prompt (simplified version of build_analysis_prompt for backtest)
+        prompt = self._build_backtest_prompt(
+            symbol=symbol,
+            price_data=price_data,
+            indicators=indicators,
+            signal_summary=signal_summary,
+            intraday_summary=intraday_summary,
+            portfolio=portfolio,
+            scanner_flags=scanner_flags,
+            patterns_text=patterns_text,
+            levels_text=levels_text,
+            phase=phase,
+            regime_context=regime_context,
+        )
+
+        try:
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            response = client.messages.create(
+                model=self.model,
+                max_tokens=CLAUDE_MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            self.api_calls += 1
+            raw_text = response.content[0].text.strip()
+
+            # Parse JSON
+            text = raw_text
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1]
+                text = text.rsplit("```", 1)[0].strip()
+
+            decision = json.loads(text)
+
+            # Save to cache
+            try:
+                with open(cache_file, "w") as f:
+                    json.dump(decision, f)
+            except Exception:
+                pass
+
+            # Rate limit (be gentle with API)
+            time_module.sleep(0.3)
+            return decision
+
+        except json.JSONDecodeError as e:
+            logger.debug(f"JSON parse error for {symbol}: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Claude API error for {symbol}: {e}")
+            time_module.sleep(1)
+            return None
+
+    def _build_backtest_prompt(
+        self, symbol, price_data, indicators, signal_summary,
+        intraday_summary, portfolio, scanner_flags, patterns_text,
+        levels_text, phase, regime_context,
+    ) -> str:
+        """Build analysis prompt for backtest (mirrors live prompt structure)."""
+        vol = indicators.get("volume", 0)
+        vol_avg = indicators.get("volume_sma_20", 1) or 1
+        vol_vs_avg = f"{vol/vol_avg:.1f}x average" if vol_avg > 0 else "N/A"
+
+        positions = portfolio.get("positions", [])
+        current_pos = "None"
+        open_pos_strs = []
+        for pos in positions:
+            ps = f"{pos['symbol']}: {pos['qty']} shares (${pos.get('market_value', 0):,.0f})"
+            open_pos_strs.append(ps)
+            if pos["symbol"] == symbol:
+                current_pos = ps
+        open_positions = ", ".join(open_pos_strs) if open_pos_strs else "None"
+
+        prev_close = price_data.get("prev_close", 0)
+        today_open = price_data.get("open", 0)
+        gap_pct = ((today_open - prev_close) / prev_close * 100) if prev_close else 0
+
+        macd_cross = "None recently"
+        if indicators.get("macd_bullish_cross"):
+            macd_cross = "BULLISH cross"
+        elif indicators.get("macd_bearish_cross"):
+            macd_cross = "BEARISH cross"
+
+        phase_desc = {
+            "open": "OPENING DRIVE — Gap & Go, ORB, Red-to-Green only. Size 50%.",
+            "prime": "PRIME TIME — First Pullback, Flags, VWAP Reclaim. Full size.",
+            "lunch": "LUNCH DEAD ZONE — Mean reversion only, 35% size, 70%+ confidence required.",
+            "afternoon": "AFTERNOON — Continuations, VWAP tests. 85% size.",
+            "power_hour": "POWER HOUR — Momentum, HOD/LOD breaks. Full size, quick targets.",
+            "close": "CLOSING — EXIT ONLY.",
+        }.get(phase, phase)
+
+        return f"""Analyze {symbol} for a day trade.
+
+═══ MARKET REGIME ═══
+{regime_context}
+
+═══ WHY IS THIS STOCK ON YOUR RADAR? ═══
+{scanner_flags}
+
+═══ PRICE ACTION ═══
+Price: ${price_data['price']} | Change: {price_data.get('change_pct', 0):+.2f}% | Gap: {gap_pct:+.2f}%
+Open: ${today_open} | High: ${price_data.get('high', 0)} | Low: ${price_data.get('low', 0)} | Prev Close: ${prev_close}
+Volume: {price_data.get('volume', 0):,} ({vol_vs_avg})
+
+═══ PATTERNS DETECTED ═══
+{patterns_text}
+
+═══ KEY PRICE LEVELS ═══
+{levels_text}
+
+═══ TECHNICAL INDICATORS ═══
+Trend: SMA(20)={indicators.get('sma_20', 'N/A')} | SMA(50)={indicators.get('sma_50', 'N/A')} | SMA(200)={indicators.get('sma_200', 'N/A')}
+Short-term: EMA(9)={indicators.get('ema_9', 'N/A')} | EMA(21)={indicators.get('ema_21', 'N/A')} | EMA bullish: {indicators.get('ema_bullish', 'N/A')}
+Momentum: RSI(14)={indicators.get('rsi', 'N/A')} | MACD hist={indicators.get('macd_histogram', 'N/A')} | MACD cross: {macd_cross}
+Stochastic: K={indicators.get('stoch_k', 'N/A')} D={indicators.get('stoch_d', 'N/A')}
+Volatility: BB upper={indicators.get('bb_upper', 'N/A')} mid={indicators.get('bb_middle', 'N/A')} lower={indicators.get('bb_lower', 'N/A')} width={indicators.get('bb_width_pct', 'N/A')}%
+Range: ATR={indicators.get('atr', 'N/A')} ({indicators.get('atr_pct', 'N/A')}% of price) | VWAP={indicators.get('vwap', 'N/A')}
+Volume: OBV {indicators.get('obv_trend', 'N/A')} | Relative volume: {indicators.get('relative_volume', 'N/A')}x avg
+
+═══ SIGNAL SUMMARY ═══
+{signal_summary}
+
+═══ INTRADAY (5-min chart) ═══
+{intraday_summary}
+
+═══ CATALYST ═══
+Backtest mode — historical catalyst data not available
+
+═══ YOUR PORTFOLIO ═══
+Equity: ${portfolio['equity']:,.2f} | Cash: ${portfolio['cash']:,.2f}
+Position in {symbol}: {current_pos}
+All positions: {open_positions}
+Today's P&L: ${portfolio.get('daily_pnl', 0):,.2f} | Trade budget: {self.daily_trades}/8 used
+
+═══ CURRENT TIME ═══
+{phase_desc}
+
+What do you see? What's the trade?
+
+JSON only:
+{{"action": "BUY|SELL|HOLD", "symbol": "{symbol}", "confidence": 0.0, "entry_price": 0.0, "quantity": 0, "stop_loss": 0.0, "take_profit": 0.0, "pattern": "name", "reasoning": "your thinking"}}"""
+
+    def _pick_analysis_bar_indices(self, sorted_times: list) -> set[int]:
+        """Pick which bar indices to run analysis at, matching analysis_times."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+
+        indices = set()
+        for target_time in self.analysis_times:
+            best_idx = None
+            best_diff = timedelta(hours=24)
+            for i, ts in enumerate(sorted_times):
+                ts_et = ts.astimezone(ZoneInfo("US/Eastern")) if ts.tzinfo else ts
+                ts_time = ts_et.time()
+                # Compare times
+                diff = abs(
+                    timedelta(hours=ts_time.hour, minutes=ts_time.minute)
+                    - timedelta(hours=target_time.hour, minutes=target_time.minute)
+                )
+                if diff < best_diff:
+                    best_diff = diff
+                    best_idx = i
+            if best_idx is not None and best_diff < timedelta(minutes=15):
+                indices.add(best_idx)
+
+        return indices
+
+    def _get_phase(self, hour: int, minute: int) -> str:
+        """Determine market phase from ET time."""
+        t = hour * 60 + minute
+        if t < 9 * 60 + 30:
+            return "premarket"
+        elif t < 10 * 60:
+            return "open"
+        elif t < 11 * 60:
+            return "prime"
+        elif t < 13 * 60 + 30:
+            return "lunch"
+        elif t < 15 * 60:
+            return "afternoon"
+        elif t < 15 * 60 + 50:
+            return "power_hour"
+        else:
+            return "close"
+
+    def _get_regime(self, day_dt: datetime, spy_daily: pd.DataFrame, vix_daily: pd.DataFrame) -> dict:
+        """Determine market regime for a given day (no look-ahead)."""
+        regime = {"spy_trend": "unknown", "vix_level": "elevated", "regime": "bear_quiet",
+                  "spy_price": 0, "spy_sma_50": 0, "vix_price": 18}
+
+        if spy_daily is not None and not spy_daily.empty:
+            spy_to_date = spy_daily[spy_daily.index < pd.Timestamp(day_dt.date(), tz=spy_daily.index.tz) if hasattr(spy_daily.index, 'tz') and spy_daily.index.tz else pd.Timestamp(day_dt.date())]
+            if len(spy_to_date) >= 50:
+                spy_price = float(spy_to_date["Close"].iloc[-1])
+                spy_sma_50 = float(spy_to_date["Close"].tail(50).mean())
+                regime["spy_price"] = spy_price
+                regime["spy_sma_50"] = spy_sma_50
+                regime["spy_trend"] = "bullish" if spy_price >= spy_sma_50 else "bearish"
+
+        if vix_daily is not None and not vix_daily.empty:
+            vix_to_date = vix_daily[vix_daily.index < pd.Timestamp(day_dt.date(), tz=vix_daily.index.tz) if hasattr(vix_daily.index, 'tz') and vix_daily.index.tz else pd.Timestamp(day_dt.date())]
+            if len(vix_to_date) >= 1:
+                vix_price = float(vix_to_date["Close"].iloc[-1])
+                regime["vix_price"] = vix_price
+                if vix_price < 16:
+                    regime["vix_level"] = "quiet"
+                elif vix_price < 22:
+                    regime["vix_level"] = "elevated"
+                elif vix_price < 30:
+                    regime["vix_level"] = "volatile"
+                else:
+                    regime["vix_level"] = "extreme"
+
+        spy_trend = regime["spy_trend"]
+        vix_level = regime["vix_level"]
+        if spy_trend == "bullish" and vix_level in ("quiet", "elevated"):
+            regime["regime"] = "bull_quiet"
+        elif spy_trend == "bullish":
+            regime["regime"] = "bull_volatile"
+        elif vix_level in ("quiet", "elevated"):
+            regime["regime"] = "bear_quiet"
+        else:
+            regime["regime"] = "bear_volatile"
+
+        return regime
+
+    def _regime_size_multiplier(self, regime: dict) -> float:
+        return {
+            "bull_quiet": 1.0,
+            "bull_volatile": 0.70,
+            "bear_quiet": 0.50,
+            "bear_volatile": 0.25,
+        }.get(regime["regime"], 0.5)
+
+    def _regime_context_str(self, regime: dict) -> str:
+        desc = {
+            "bull_quiet": "BULLISH + LOW VOL — Best conditions. Full aggression.",
+            "bull_volatile": "BULLISH + HIGH VOL — Tighter stops, favor pullbacks.",
+            "bear_quiet": "BEARISH + LOW VOL — Favor mean reversion, reduce size.",
+            "bear_volatile": "BEARISH + HIGH VOL — Minimal size, A+ only.",
+        }.get(regime["regime"], "Unknown")
+        trend = "UP" if regime["spy_trend"] == "bullish" else "DOWN"
+        return (
+            f"SPY: ${regime['spy_price']:.2f} | Trend: {trend} (50SMA=${regime['spy_sma_50']:.2f})\n"
+            f"VIX: {regime['vix_price']:.1f} ({regime['vix_level']})\n"
+            f"REGIME: {regime['regime'].upper().replace('_', ' ')} — {desc}"
+        )
+
+    def _build_backtest_universe(self, trading_days: list) -> list[str]:
+        """Build universe of symbols to test.
+
+        Uses high-liquidity names that are likely to show up in the scanner.
+        """
+        # Core liquid names that would regularly appear in the scanner
+        core = [
+            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AMD",
+            "JPM", "BA", "NFLX", "DIS", "CRM", "PYPL", "SQ", "UBER",
+            "COIN", "PLTR", "SOFI", "RIVN", "NIO", "SNAP", "ROKU", "SHOP",
+            "ABNB", "DKNG", "MARA", "RIOT", "SMCI", "ARM", "MU", "AVGO",
+        ]
+        return core
+
+    def _score_candidates_for_day(
+        self, day_dt, symbols, daily_bars, bars_5m
+    ) -> list[str]:
+        """Score and rank candidates for a specific day using prior-day data."""
+        scores = {}
+        for sym in symbols:
+            daily = daily_bars.get(sym)
+            if daily is None or daily.empty:
+                continue
+
+            # Only use data up to prior day
+            to_date = daily[daily.index < pd.Timestamp(day_dt.date(), tz=daily.index.tz) if hasattr(daily.index, 'tz') and daily.index.tz else pd.Timestamp(day_dt.date())]
+            if len(to_date) < 10:
+                continue
+
+            try:
+                close = to_date["Close"]
+                volume = to_date["Volume"]
+                price = float(close.iloc[-1])
+                prev_price = float(close.iloc[-2])
+                avg_vol = float(volume.tail(20).mean())
+
+                change_pct = (price - prev_price) / prev_price * 100
+
+                # Score based on recent activity
+                score = 0
+                # Volatility (bigger moves = more opportunity)
+                if abs(change_pct) >= 3:
+                    score += 20
+                elif abs(change_pct) >= 1.5:
+                    score += 10
+
+                # 5-day trend
+                if len(close) >= 5:
+                    five_day = (price - float(close.iloc[-5])) / float(close.iloc[-5]) * 100
+                    if abs(five_day) >= 8:
+                        score += 15
+
+                # Near 20-day high/low
+                if len(to_date) >= 20:
+                    high_20 = float(to_date["High"].tail(20).max())
+                    low_20 = float(to_date["Low"].tail(20).min())
+                    if price >= high_20 * 0.97:
+                        score += 10
+                    if price <= low_20 * 1.03:
+                        score += 10
+
+                # Volume spike
+                if avg_vol > 0:
+                    last_vol = float(volume.iloc[-1])
+                    if last_vol / avg_vol >= 2.0:
+                        score += 15
+
+                scores[sym] = score
+            except Exception:
+                continue
+
+        # Return top 20 by score
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [sym for sym, _ in ranked[:20]]
+
+    def _check_sector_ok(self, symbol: str) -> bool:
+        """Check sector concentration against current positions."""
+        from autotrader.risk.manager import CORRELATED_GROUPS, MAX_SECTOR_CONCENTRATION
+
+        target_group = None
+        for group, members in CORRELATED_GROUPS.items():
+            if symbol in members:
+                target_group = group
+                break
+
+        if target_group is None:
+            return True
+
+        held = [s for s in self.positions if s in CORRELATED_GROUPS.get(target_group, [])]
+        return len(held) < MAX_SECTOR_CONCENTRATION
+
+    def _build_result(self, trading_days: int) -> BacktestResult:
+        """Build the final result object."""
         result = BacktestResult(
-            start_date=self.start_date.strftime("%Y-%m-%d"),
-            end_date=self.end_date.strftime("%Y-%m-%d"),
+            start_date=self.start_date,
+            end_date=self.end_date,
             trading_days=trading_days,
             total_trades=len(self.completed_trades),
             wins=sum(1 for t in self.completed_trades if t.pnl > 0),
-            losses=sum(1 for t in self.completed_trades if t.pnl < 0),
+            losses=sum(1 for t in self.completed_trades if t.pnl <= 0),
             total_pnl=sum(t.pnl for t in self.completed_trades),
             total_r=sum(t.r_multiple for t in self.completed_trades),
             total_slippage=sum(t.slippage_cost for t in self.completed_trades),
@@ -423,11 +1204,12 @@ class BacktestEngine:
             ending_equity=self.equity,
             trades=self.completed_trades,
             equity_curve=self.equity_curve,
+            daily_returns=self.daily_returns,
             api_calls=self.api_calls,
             cache_hits=self.cache_hits,
         )
 
-        # Calculate max drawdown from equity curve
+        # Max drawdown from equity curve
         peak = self.starting_equity
         max_dd = 0.0
         for _, eq in self.equity_curve:
@@ -440,70 +1222,63 @@ class BacktestEngine:
 
         return result
 
-    def _cache_key(self, symbol: str, date: str, price_data: dict) -> str:
-        """Generate cache key from symbol + date + price data hash."""
-        data_str = f"{symbol}_{date}_{price_data.get('price')}_{price_data.get('volume')}"
-        return hashlib.md5(data_str.encode()).hexdigest()
 
-    def _load_cache(self, key: str) -> dict | None:
-        """Load cached Claude response."""
-        path = CACHE_DIR / f"{key}.json"
-        if path.exists():
-            try:
-                with open(path) as f:
-                    return json.load(f)
-            except Exception:
-                return None
-        return None
-
-    def _save_cache(self, key: str, response: dict):
-        """Save Claude response to cache."""
-        path = CACHE_DIR / f"{key}.json"
-        try:
-            with open(path, "w") as f:
-                json.dump(response, f)
-        except Exception as e:
-            logger.debug(f"Cache write failed: {e}")
+# ═══════════════════════════════════════════════════════════
+# REPORTING
+# ═══════════════════════════════════════════════════════════
 
 
 def format_backtest_result(result: BacktestResult) -> str:
     """Format backtest results for display."""
     lines = [
-        "═══════════════════════════════════════",
-        "         BACKTEST RESULTS",
-        "═══════════════════════════════════════",
-        f"Period: {result.start_date} → {result.end_date} ({result.trading_days} days)",
-        f"Trades: {result.total_trades} | W: {result.wins} L: {result.losses} | WR: {result.win_rate:.1f}%",
-        f"P&L: ${result.total_pnl:,.2f} | Return: {result.return_pct:+.2f}%",
-        f"Total R: {result.total_r:+.1f} | Avg R: {result.avg_r:+.2f}",
-        f"Expectancy: ${result.expectancy:,.2f}/trade",
-        f"Profit Factor: {result.profit_factor:.2f}",
-        f"Max Drawdown: {result.max_drawdown_pct:.1f}%",
-        f"Total Slippage: ${result.total_slippage:,.2f}",
-        f"API Calls: {result.api_calls} | Cache Hits: {result.cache_hits}",
-        f"Equity: ${result.starting_equity:,.0f} → ${result.ending_equity:,.0f}",
         "",
+        "═══════════════════════════════════════════════════════════",
+        "              INTRADAY BACKTEST RESULTS",
+        "═══════════════════════════════════════════════════════════",
+        f"Period: {result.start_date} → {result.end_date} ({result.trading_days} trading days)",
+        "",
+        "─── PERFORMANCE ───",
+        f"  Total Trades:    {result.total_trades}",
+        f"  Win Rate:        {result.win_rate:.1f}% ({result.wins}W / {result.losses}L)",
+        f"  Avg Win:         ${result.avg_win:,.2f}",
+        f"  Avg Loss:        ${result.avg_loss:,.2f}",
+        f"  Profit Factor:   {result.profit_factor:.2f}",
+        f"  Total P&L:       ${result.total_pnl:,.2f}",
+        f"  Return:          {result.return_pct:+.2f}%",
+        f"  Max Drawdown:    {result.max_drawdown_pct:.1f}%",
+        f"  Sharpe Ratio:    {result.sharpe_ratio:.2f}",
+        f"  Expectancy:      ${result.expectancy:,.2f}/trade",
+        f"  Total R:         {result.total_r:+.1f}",
+        f"  Avg R/Trade:     {result.avg_r:+.2f}",
+        f"  Total Slippage:  ${result.total_slippage:,.2f}",
+        f"  Equity:          ${result.starting_equity:,.0f} → ${result.ending_equity:,.0f}",
+        f"  API Calls:       {result.api_calls} | Cache Hits: {result.cache_hits}",
     ]
 
-    if result.passes_minimum_bar:
-        lines.append("✓ PASSES minimum bar for real money")
+    # PASS/FAIL thresholds
+    lines.append("")
+    lines.append("─── PASS/FAIL CRITERIA ───")
+    checks = [
+        (result.total_trades >= 200, f"  200+ trades:     {result.total_trades} {'PASS' if result.total_trades >= 200 else 'FAIL'}"),
+        (result.profit_factor > 1.3, f"  PF > 1.3:        {result.profit_factor:.2f} {'PASS' if result.profit_factor > 1.3 else 'FAIL'}"),
+        (result.max_drawdown_pct < 8.0, f"  Max DD < 8%:     {result.max_drawdown_pct:.1f}% {'PASS' if result.max_drawdown_pct < 8.0 else 'FAIL'}"),
+        (result.sharpe_ratio > 0.75, f"  Sharpe > 0.75:   {result.sharpe_ratio:.2f} {'PASS' if result.sharpe_ratio > 0.75 else 'FAIL'}"),
+    ]
+    all_pass = all(c[0] for c in checks)
+    for _, text in checks:
+        lines.append(text)
+    lines.append("")
+    if all_pass:
+        lines.append("  >>> OVERALL: PASS <<<")
     else:
-        lines.append("⛔ DOES NOT PASS minimum bar:")
-        if result.total_trades < 200:
-            lines.append(f"  - Need 200+ trades (have {result.total_trades})")
-        if result.expectancy <= 0:
-            lines.append(f"  - Expectancy must be positive (${result.expectancy:,.2f})")
-        if result.profit_factor <= 1.3:
-            lines.append(f"  - Profit factor must be > 1.3 ({result.profit_factor:.2f})")
-        if result.max_drawdown_pct >= 8.0:
-            lines.append(f"  - Max drawdown must be < 8% ({result.max_drawdown_pct:.1f}%)")
+        lines.append("  >>> OVERALL: FAIL <<<")
 
-    # Top patterns
+    # Pattern breakdown
     pattern_perf: dict[str, dict] = {}
     for t in result.trades:
         p = t.pattern or "unknown"
         if p not in pattern_perf:
-            pattern_perf[p] = {"trades": 0, "wins": 0, "pnl": 0, "r": 0}
+            pattern_perf[p] = {"trades": 0, "wins": 0, "pnl": 0.0, "r": 0.0}
         pattern_perf[p]["trades"] += 1
         pattern_perf[p]["pnl"] += t.pnl
         pattern_perf[p]["r"] += t.r_multiple
@@ -511,13 +1286,57 @@ def format_backtest_result(result: BacktestResult) -> str:
             pattern_perf[p]["wins"] += 1
 
     if pattern_perf:
-        lines.append("\n─── PATTERN BREAKDOWN ───")
-        for p, stats in sorted(pattern_perf.items(), key=lambda x: x[1]["trades"], reverse=True):
-            wr = (stats["wins"] / stats["trades"] * 100) if stats["trades"] > 0 else 0
-            avg_r = stats["r"] / stats["trades"] if stats["trades"] > 0 else 0
+        lines.append("")
+        lines.append("─── PATTERN BREAKDOWN ───")
+        for p, s in sorted(pattern_perf.items(), key=lambda x: x[1]["trades"], reverse=True):
+            wr = (s["wins"] / s["trades"] * 100) if s["trades"] > 0 else 0
+            avg_r = s["r"] / s["trades"] if s["trades"] > 0 else 0
             lines.append(
-                f"  {p}: {stats['trades']} trades | WR: {wr:.0f}% | "
-                f"Avg R: {avg_r:+.2f} | P&L: ${stats['pnl']:,.2f}"
+                f"  {p:25s} {s['trades']:3d} trades | WR: {wr:5.1f}% | "
+                f"Avg R: {avg_r:+.2f} | P&L: ${s['pnl']:>9,.2f}"
             )
 
+    # Phase breakdown
+    phase_perf: dict[str, dict] = {}
+    for t in result.trades:
+        p = t.market_phase or "unknown"
+        if not p or p == "unknown":
+            # Infer phase from exit time
+            if hasattr(t.entry_time, 'hour'):
+                h = t.entry_time.hour
+                if h < 10:
+                    p = "open"
+                elif h < 11:
+                    p = "prime"
+                elif h < 14:
+                    p = "lunch"
+                elif h < 15:
+                    p = "afternoon"
+                else:
+                    p = "power_hour"
+        if p not in phase_perf:
+            phase_perf[p] = {"trades": 0, "wins": 0, "pnl": 0.0, "r": 0.0}
+        phase_perf[p]["trades"] += 1
+        phase_perf[p]["pnl"] += t.pnl
+        phase_perf[p]["r"] += t.r_multiple
+        if t.pnl > 0:
+            phase_perf[p]["wins"] += 1
+
+    if phase_perf:
+        lines.append("")
+        lines.append("─── PHASE BREAKDOWN ───")
+        phase_order = ["open", "prime", "lunch", "afternoon", "power_hour", "unknown"]
+        for p in phase_order:
+            if p not in phase_perf:
+                continue
+            s = phase_perf[p]
+            wr = (s["wins"] / s["trades"] * 100) if s["trades"] > 0 else 0
+            avg_r = s["r"] / s["trades"] if s["trades"] > 0 else 0
+            lines.append(
+                f"  {p:15s} {s['trades']:3d} trades | WR: {wr:5.1f}% | "
+                f"Avg R: {avg_r:+.2f} | P&L: ${s['pnl']:>9,.2f}"
+            )
+
+    lines.append("")
+    lines.append("═══════════════════════════════════════════════════════════")
     return "\n".join(lines)

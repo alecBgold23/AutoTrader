@@ -198,22 +198,51 @@ Reports run daily (logged) and weekly (Telegram).
 
 ## Backtesting (`autotrader/backtest/`)
 
-Replays historical days through the same Claude → Risk → Position logic.
+**Intraday 5-minute bar replay** — simulates exactly what the live system sees at each point in time.
 
+### Architecture
+- `data_fetcher.py` — Fetches 5-min bars from Alpaca, daily bars from yfinance, cached as CSV in `data/backtest_cache/`
+- `engine.py` — Core replay engine: bar-by-bar simulation with Claude analysis, position management, risk checks
+- `runner.py` — CLI interface
+
+### What it simulates
+1. Builds universe and scores candidates using prior-day data (no look-ahead)
+2. Steps through each trading day in 5-minute increments starting at 9:30 AM ET
+3. At scheduled analysis times, feeds Claude the same indicators, patterns, key levels, VWAP from 5-min data
+4. Applies phase-specific confidence thresholds, position sizing multipliers, and pattern preferences
+5. Applies regime-aware sizing (SPY trend + VIX level from prior close)
+6. Fills buy orders at next bar's open + $0.02/share slippage
+7. Runs full PositionManager: scale-out 1/3 at 1R, 1/3 at 2R, 2% trailing stop on remainder
+8. Time exits: half at 30 min to close, full at 15 min, force-close at 3:50 PM ET
+9. Enforces all risk limits: 2% daily loss halt, 3-loss cooldown, sector concentration, 40% max exposure
+
+### Cost management
+- Claude responses cached in `data/claude_cache/` (keyed by symbol + date + time + price + volume)
+- `--model` flag: defaults to `claude-haiku-4-5-20251001` for cheap bulk runs
+- `--max-cycles-per-day` flag: defaults to 6 (open, 10:00, 10:30, 11:30, 2:00, 3:15)
+
+### Usage
 ```bash
-# Quick test (cheap, ~$5)
-python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-01-31 --symbols AAPL,NVDA,TSLA,AMD,META
+# 20-day test on Haiku (verify engine works)
+python -m autotrader.backtest.runner --start 2025-03-01 --end 2025-03-28 --model claude-haiku-4-5-20251001
 
-# Full validation with Haiku (~$10-20)
-python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-01 --model claude-haiku-4-5-20251001
+# Full 60-day validation
+python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-28 --model claude-haiku-4-5-20251001 --max-cycles-per-day 6
 
-# Final Sonnet run (~$30)
-python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-01
+# Final Sonnet run
+python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-28 --model claude-sonnet-4-20250514
 ```
 
-Key design: $0.02/share slippage, API response caching (repeat runs don't re-call Claude), each run saves JSON results to `data/backtest_results/`.
+### PASS/FAIL thresholds
+- 200+ trades: required
+- Profit factor > 1.3: required
+- Max drawdown < 8%: required
+- Sharpe > 0.75: required
 
-**Minimum bar before real money:** 200+ trades, positive expectancy, profit factor > 1.3, max drawdown < 8%.
+### Output
+- Console: full metrics, pattern breakdown, phase breakdown, PASS/FAIL
+- `data/backtest_results/equity_YYYYMMDD_HHMMSS.csv` — equity curve
+- `data/backtest_results/backtest_YYYYMMDD_HHMMSS.json` — full results with all trades
 
 ---
 
