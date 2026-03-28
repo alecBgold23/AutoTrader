@@ -64,7 +64,7 @@ BACKTEST_RISK = {
     "max_trades_per_day": 25,             # Room for 20+ trades
     "min_risk_reward_ratio": 1.5,         # Slightly relaxed from 2:1
     "min_confidence_to_trade": 0.50,      # Lower floor, confidence scaling handles the rest
-    "analyze_count": 15,                  # Symbols per cycle (up from 8)
+    "analyze_count": 10,                  # Symbols per cycle (filtered by pre-filter)
 }
 
 
@@ -614,6 +614,10 @@ class BacktestEngine:
                     if not self._check_sector_ok(sym):
                         continue
 
+                    # Technical pre-filter: skip boring setups before paying for Claude
+                    if not self._should_call_claude(price_data, indicators, patterns_text):
+                        continue
+
                     # Ask Claude
                     decision = self._ask_claude(
                         symbol=sym,
@@ -872,6 +876,88 @@ class BacktestEngine:
             self.peak_equity = self.equity
 
         del self.positions[symbol]
+
+    def _should_call_claude(
+        self, price_data: dict, indicators: dict, patterns_text: str
+    ) -> bool:
+        """Technical pre-filter: only call Claude on genuinely interesting setups.
+
+        Uses data already computed (free). Eliminates ~60% of boring-stock calls
+        that would return HOLD anyway.
+
+        Scoring:
+          RVOL ≥ 3x       → 40pts   RVOL ≥ 2x     → 25pts
+          RVOL ≥ 1.5x     → 15pts   RVOL ≥ 1.2x   →  5pts
+          Change ≥ 4%     → 25pts   Change ≥ 2%   → 15pts   Change ≥ 1% → 8pts
+          Intraday ≥ 3%   → 20pts   Intraday ≥1.5% → 10pts  Intraday ≥0.8% → 5pts
+          Pattern detected → 20pts
+          RSI ≥70 or ≤30  → 15pts   RSI ≥65 or ≤35 →  8pts
+          At VWAP (≤0.4%) → 15pts   Far VWAP (≥2%) → 10pts
+
+        Threshold: 25 pts required to call Claude.
+        Examples that PASS:
+          RVOL 1.5x (15) + gap 1% (8) + any pattern (20) = 43 ✓
+          RVOL 2x (25) alone = 25 ✓
+          Gap 2% (15) + pattern (20) = 35 ✓
+        Examples that FAIL (saved API call):
+          Flat stock, RVOL 1.1x, no gap, no patterns = 0 ✗
+          Minor 0.8% move, no RVOL, no pattern = 5 ✗
+        """
+        score = 0
+
+        # 1. Relative volume — most important day-trading signal
+        rvol = float(indicators.get("relative_volume") or 0)
+        if rvol >= 3.0:
+            score += 40
+        elif rvol >= 2.0:
+            score += 25
+        elif rvol >= 1.5:
+            score += 15
+        elif rvol >= 1.2:
+            score += 5
+
+        # 2. Daily change % (gap + intraday combined)
+        change_pct = abs(float(price_data.get("change_pct", 0)))
+        if change_pct >= 4.0:
+            score += 25
+        elif change_pct >= 2.0:
+            score += 15
+        elif change_pct >= 1.0:
+            score += 8
+
+        # 3. Intraday move from today's open
+        price = float(price_data.get("price", 0))
+        today_open = float(price_data.get("open", price) or price)
+        if today_open > 0 and price > 0:
+            intraday_move = abs((price - today_open) / today_open * 100)
+            if intraday_move >= 3.0:
+                score += 20
+            elif intraday_move >= 1.5:
+                score += 10
+            elif intraday_move >= 0.8:
+                score += 5
+
+        # 4. Detected patterns (already computed — free signal)
+        if patterns_text and len(patterns_text.strip()) > 15 and "No patterns" not in patterns_text:
+            score += 20
+
+        # 5. RSI at extremes (momentum continuation or oversold bounce)
+        rsi = float(indicators.get("rsi") or 50)
+        if rsi >= 70 or rsi <= 30:
+            score += 15
+        elif rsi >= 65 or rsi <= 35:
+            score += 8
+
+        # 6. VWAP proximity — at VWAP = high-probability reclaim/rejection zone
+        vwap = indicators.get("vwap") or indicators.get("vwap_5m")
+        if vwap and price > 0:
+            vwap_dist_pct = abs((price - float(vwap)) / float(vwap) * 100)
+            if vwap_dist_pct <= 0.4:   # Right at VWAP = prime setup zone
+                score += 15
+            elif vwap_dist_pct >= 2.0:  # Extended from VWAP = potential reclaim trade
+                score += 10
+
+        return score >= 25
 
     def _ask_claude(
         self, symbol, price_data, indicators, signal_summary,
