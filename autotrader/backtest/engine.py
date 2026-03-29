@@ -30,6 +30,9 @@ SLIPPAGE_PER_SHARE = 0.02
 CLAUDE_CACHE_DIR = BASE_DIR / "data" / "claude_cache"
 CLAUDE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Bump this when the prompt changes to invalidate cached responses
+PROMPT_VERSION = "v2"
+
 
 def _tz_aware_timestamp(dt, index):
     """Create a Timestamp compatible with a DataFrame's index timezone."""
@@ -38,22 +41,24 @@ def _tz_aware_timestamp(dt, index):
         ts = ts.tz_localize(index.tz)
     return ts
 
-# Default analysis times (ET) — more frequent = more trade opportunities
+# Analysis times ordered for best full-day coverage when sliced to [:N].
+# First 10 cover every phase of the day; extras fill prime-time gaps.
 DEFAULT_ANALYSIS_TIMES = [
     time(9, 35),   # Open (ORB forming)
-    time(9, 50),   # Late open
     time(10, 0),   # Prime start (10 AM reversal zone)
-    time(10, 15),  # Prime
     time(10, 30),  # Prime mid
-    time(10, 45),  # Prime late
-    time(11, 15),  # Late morning
+    time(11, 0),   # Late morning
     time(11, 45),  # Lunch
     time(13, 0),   # Mid-day
     time(14, 0),   # Afternoon
+    time(14, 45),  # Afternoon late
+    time(15, 15),  # Power hour
+    time(15, 35),  # Power hour late
+    # Extra slots if cycles > 10
+    time(9, 50),   # Late open
+    time(10, 15),  # Prime extra
+    time(10, 45),  # Prime extra
     time(14, 30),  # Afternoon mid
-    time(15, 0),   # Power hour start
-    time(15, 15),  # Power hour mid
-    time(15, 30),  # Power hour late
 ]
 
 # Backtest-specific risk parameters (more aggressive than live for discovery)
@@ -66,6 +71,88 @@ BACKTEST_RISK = {
     "min_confidence_to_trade": 0.50,      # Lower floor, confidence scaling handles the rest
     "analyze_count": 10,                  # Symbols per cycle (filtered by pre-filter)
 }
+
+# ═══════════════════════════════════════════════════════════
+# BACKTEST SYSTEM PROMPT — more aggressive than live for signal discovery
+# ═══════════════════════════════════════════════════════════
+
+BACKTEST_SYSTEM_PROMPT = """You are a day trader running a BACKTEST. Your job is to find tradeable setups so the system can measure which patterns actually make money.
+
+This is signal discovery, not live trading. You are evaluated on:
+1. Finding REAL setups — patterns with clear entries, stops, and targets
+2. Volume of signals — you should find 2-4 tradeable setups per analysis cycle
+3. Variety — momentum, reversal, VWAP, ORB, flags, mean reversion, everything
+4. Accuracy of risk levels — logical stop losses and realistic take profits
+
+═══════════════════════════════════════════════════════
+YOUR APPROACH
+═══════════════════════════════════════════════════════
+
+For every stock, identify:
+1. WHAT pattern is forming (ORB breakout, VWAP reclaim, flag, oversold bounce, mean reversion)
+2. WHERE is the entry (specific price at the setup trigger)
+3. WHERE is the stop (below the pattern invalidation — a LOGICAL level, not arbitrary %)
+4. WHERE is the target (next resistance/support, or 2-3x the risk distance)
+
+If you see a recognizable setup with clear risk/reward → BUY.
+The system handles position sizing and risk limits — your job is to find the setup.
+
+═══════════════════════════════════════════════════════
+SETUPS (your playbook)
+═══════════════════════════════════════════════════════
+
+MOMENTUM (trading WITH the move):
+• Gap & Go — Stock gaps with volume, ride continuation after first pullback
+• Opening Range Breakout — Price breaks first 30-min range with conviction
+• First Pullback — Strong open → pullback on declining volume → bounces = entry
+• Bull/Bear Flag — Trend → tight consolidation → breakout with volume
+• VWAP Reclaim — Stock reclaims VWAP from below = bullish shift in control
+• HOD/LOD Break — New high/low of day with volume = momentum continuation
+
+REVERSAL (need clear level + volume):
+• Oversold Bounce at Support — RSI extreme + real support level + volume
+• Mean Reversion — Extended beyond Bollinger Bands + snapping back toward VWAP
+• Hammer at Support — Reversal candle at a key level with volume confirmation
+• Volume Climax Reversal — Massive volume spike at price extreme = exhaustion
+
+You need ONE clear setup with conviction. Don't overthink it.
+
+═══════════════════════════════════════════════════════
+MARKET REGIME (context, NOT a constraint)
+═══════════════════════════════════════════════════════
+
+You'll be told the market regime (SPY trend + VIX level). Use this to choose WHICH setups to favor:
+
+BULLISH regime → favor momentum: breakouts, flags, HOD breaks, Gap & Go
+BEARISH regime → favor mean reversion: oversold bounces, VWAP reclaims, support reversals
+HIGH VIX → wider swings = wider stops but BIGGER targets, not fewer trades
+
+The regime tells you which DIRECTION to lean, not whether to trade.
+Bearish markets have EXCELLENT mean reversion and oversold bounce opportunities — find them.
+
+═══════════════════════════════════════════════════════
+CONFIDENCE SCALE (use the full range)
+═══════════════════════════════════════════════════════
+
+confidence: 0.0-1.0
+- 0.50-0.59: Pattern forming, acceptable R:R. Worth a small position.
+- 0.60-0.69: Pattern confirmed, good R:R. Standard trade.
+- 0.70-0.79: Pattern + volume confirming. Above-average conviction.
+- 0.80-0.89: Multiple confluences aligning. Strong trade.
+- 0.90+: Textbook setup, volume screaming, obvious entry. Full conviction.
+
+USE THE FULL RANGE. A marginal setup = 0.55. A strong breakout with volume = 0.85.
+
+═══════════════════════════════════════════════════════
+OUTPUT
+═══════════════════════════════════════════════════════
+
+Output ONLY valid JSON. No markdown, no code fences.
+
+{"action": "BUY|SELL|HOLD", "symbol": "TICKER", "confidence": 0.0, "entry_price": 0.0, "quantity": 0, "stop_loss": 0.0, "take_profit": 0.0, "pattern": "setup name", "reasoning": "What pattern, what level, what your edge is"}
+
+BUY when you see a setup. HOLD only when there is genuinely no pattern forming.
+If you find yourself holding on every stock in a cycle, look harder — there are always setups if you look for the right type (momentum in bull markets, reversals in bear markets)."""
 
 
 def _confidence_risk_scale(confidence: float) -> float:
@@ -246,7 +333,7 @@ class BacktestEngine:
         end: str,
         starting_equity: float = 100_000.0,
         model: str = "claude-haiku-4-5-20251001",
-        max_cycles_per_day: int = 8,
+        max_cycles_per_day: int = 10,
         max_trades_per_day: int = 25,
     ):
         self.start_date = start
@@ -957,7 +1044,7 @@ class BacktestEngine:
             elif vwap_dist_pct >= 2.0:  # Extended from VWAP = potential reclaim trade
                 score += 10
 
-        return score >= 25
+        return score >= 15
 
     def _ask_claude(
         self, symbol, price_data, indicators, signal_summary,
@@ -967,10 +1054,9 @@ class BacktestEngine:
         """Ask Claude for a trading decision, with caching."""
         import anthropic
         from autotrader.config import ANTHROPIC_API_KEY, CLAUDE_MAX_TOKENS
-        from autotrader.brain.prompts import SYSTEM_PROMPT
 
-        # Build cache key from all inputs
-        cache_data = f"{symbol}_{day_str}_{time_str}_{price_data.get('price')}_{price_data.get('volume')}_{phase}"
+        # Build cache key — includes PROMPT_VERSION so prompt changes invalidate cache
+        cache_data = f"{PROMPT_VERSION}_{symbol}_{day_str}_{time_str}_{price_data.get('price')}_{price_data.get('volume')}_{phase}"
         cache_key = hashlib.md5(cache_data.encode()).hexdigest()
         cache_file = CLAUDE_CACHE_DIR / f"{cache_key}.json"
 
@@ -1003,7 +1089,7 @@ class BacktestEngine:
             response = client.messages.create(
                 model=self.model,
                 max_tokens=CLAUDE_MAX_TOKENS,
-                system=SYSTEM_PROMPT,
+                system=BACKTEST_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
             )
             self.api_calls += 1
@@ -1067,11 +1153,11 @@ class BacktestEngine:
             macd_cross = "BEARISH cross"
 
         phase_desc = {
-            "open": "OPENING DRIVE — Gap & Go, ORB, Red-to-Green only. Size 50%.",
-            "prime": "PRIME TIME — First Pullback, Flags, VWAP Reclaim. Full size.",
-            "lunch": "LUNCH DEAD ZONE — Mean reversion only, 35% size, 70%+ confidence required.",
-            "afternoon": "AFTERNOON — Continuations, VWAP tests. 85% size.",
-            "power_hour": "POWER HOUR — Momentum, HOD/LOD breaks. Full size, quick targets.",
+            "open": "OPENING DRIVE — Gap & Go, ORB, Red-to-Green. High volatility, early setups forming.",
+            "prime": "PRIME TIME — Best hour for setups. First Pullback, Flags, VWAP Reclaim.",
+            "lunch": "MIDDAY — Volume lower. Mean reversion and support bounces work best here.",
+            "afternoon": "AFTERNOON — Momentum continuations, VWAP tests, new HOD/LOD setups.",
+            "power_hour": "POWER HOUR — Real institutional volume. Momentum, HOD/LOD breaks.",
             "close": "CLOSING — EXIT ONLY.",
         }.get(phase, phase)
 
