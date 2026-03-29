@@ -999,7 +999,7 @@ class BacktestEngine:
         )
 
         try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=1)
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=1, timeout=30.0)
             response = client.messages.create(
                 model=self.model,
                 max_tokens=CLAUDE_MAX_TOKENS,
