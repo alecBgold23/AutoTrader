@@ -602,6 +602,11 @@ class BacktestEngine:
                 if phase == "lunch":
                     continue
 
+                # Block new entries after 2:30 PM ET — late-day entries have
+                # low win rates and leave no time for thesis to play out.
+                if hour >= 15 or (hour == 14 and minute >= 30):
+                    continue
+
                 # Check daily loss halt
                 if self.equity > 0 and self.daily_pnl < 0:
                     daily_loss_pct = abs(self.daily_pnl) / self.equity
@@ -824,7 +829,7 @@ class BacktestEngine:
     def _manage_positions_at_bar(
         self, current_time: datetime, sym_day_bars: dict, hour: int, minute: int
     ):
-        """Check stops, scale-outs, trailing stops, and time exits for all positions."""
+        """Check stops, scale-outs, and hard 20-minute time stop for all positions."""
         for sym in list(self.positions.keys()):
             pos = self.positions[sym]
             if sym not in sym_day_bars:
@@ -877,33 +882,20 @@ class BacktestEngine:
                     pos.scale_out_stage = 1
                     pos.current_stop = pos.entry_price  # Move to breakeven
 
-            # Take profit at 1.5R on remaining — close entire position
-            # Data shows only 11% of positions reach 2R; 1.5R captures profit
-            # before time exits give it all back (+$5 avg time exit vs +$93 at 2R)
-            elif (pos.scale_out_stage == 1
-                  and bar_high >= pos.entry_price + pos.risk_per_share * 1.5):
-                actual_sell = pos.shares_remaining
-                target_price = pos.entry_price + pos.risk_per_share * 1.5
-                if actual_sell > 0:
-                    exit_price = target_price - SLIPPAGE_PER_SHARE
-                    pnl = (exit_price - pos.entry_price) * actual_sell
-                    slippage = SLIPPAGE_PER_SHARE * 2 * actual_sell
-                    r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
-
-                    self.completed_trades.append(BacktestTrade(
-                        symbol=sym, pattern=pos.pattern,
-                        entry_price=pos.entry_price, exit_price=exit_price,
-                        quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
-                        entry_time=pos.entry_time, exit_time=current_time,
-                        exit_reason="Take profit 1.5R (close remaining)",
-                        confidence=pos.confidence, slippage_cost=slippage,
-                    ))
-                    self.equity += pnl
-                    self.daily_pnl += pnl
-                    pos.shares_remaining = 0
-                    pos.realized_pnl += pnl
-                    pos.scale_out_stage = 2
-                    del self.positions[sym]
+            # 30-minute time stop with winner exception
+            # If profitable (>0.5R up), switch to tight trailing stop instead of hard close.
+            # If flat or losing at 30 min, close immediately — thesis is dead.
+            hold_minutes = (current_time - pos.entry_time).total_seconds() / 60
+            if hold_minutes >= 30:
+                current_r = (bar_close - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+                if current_r > 0.5:
+                    # Winner exception: set tight trailing stop at 0.3R below current price
+                    tight_trail = bar_close - (0.3 * pos.risk_per_share)
+                    pos.current_stop = max(tight_trail, pos.entry_price)  # Floor at breakeven
+                    # Don't close — let the trailing stop manage the exit
+                else:
+                    exit_price = bar_close - SLIPPAGE_PER_SHARE
+                    self._close_position(sym, exit_price, current_time, "Time stop (30min)")
                     continue
 
             # Trailing stop after 1R scale-out: trail at 1R from high, floor at breakeven
@@ -912,33 +904,6 @@ class BacktestEngine:
                 trail_stop = max(r_trail, pos.entry_price)
                 if trail_stop > pos.current_stop:
                     pos.current_stop = trail_stop
-
-            # Time exit: 30 min to close → sell half
-            minutes_to_close = (16 * 60) - (hour * 60 + minute)
-            if minutes_to_close <= 30 and minutes_to_close > 15 and pos.shares_remaining > 1:
-                sell_qty = max(1, int(pos.shares_remaining / 2))
-                exit_price = bar_close - SLIPPAGE_PER_SHARE
-                pnl = (exit_price - pos.entry_price) * sell_qty
-                slippage = SLIPPAGE_PER_SHARE * 2 * sell_qty
-                r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
-
-                self.completed_trades.append(BacktestTrade(
-                    symbol=sym, pattern=pos.pattern,
-                    entry_price=pos.entry_price, exit_price=exit_price,
-                    quantity=sell_qty, pnl=pnl, r_multiple=r_mult,
-                    entry_time=pos.entry_time, exit_time=current_time,
-                    exit_reason=f"Time exit ({minutes_to_close}min to close)",
-                    confidence=pos.confidence, slippage_cost=slippage,
-                ))
-                self.equity += pnl
-                self.daily_pnl += pnl
-                pos.shares_remaining -= sell_qty
-                pos.realized_pnl += pnl
-
-            # Time exit: 15 min to close → close all
-            if minutes_to_close <= 15:
-                exit_price = bar_close - SLIPPAGE_PER_SHARE
-                self._close_position(sym, exit_price, current_time, f"EOD close ({minutes_to_close}min)")
 
     def _force_close_all(self, close_time, sym_day_bars, bar_idx, sorted_times):
         """Force close all positions at EOD."""
