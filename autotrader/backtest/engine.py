@@ -26,7 +26,7 @@ from autotrader.config import BASE_DIR, RISK, PHASE_CONFIG
 
 logger = logging.getLogger(__name__)
 
-SLIPPAGE_PER_SHARE = 0.02
+SLIPPAGE_PER_SHARE = 0.01  # $0.01/share — realistic for liquid large/mid-caps
 CLAUDE_CACHE_DIR = BASE_DIR / "data" / "claude_cache"
 CLAUDE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -63,12 +63,12 @@ DEFAULT_ANALYSIS_TIMES = [
 
 # Backtest-specific risk parameters (more aggressive than live for discovery)
 BACKTEST_RISK = {
-    "max_risk_per_trade_pct": 0.20,       # 20% max ($20k on $100k) — scaled by confidence
-    "max_position_pct": 0.25,             # 25% max in one stock
+    "max_risk_per_trade_pct": 0.15,       # 15% max ($15k on $100k) — day trading, flat by EOD
+    "max_position_pct": 0.20,             # 20% max in one stock
     "max_total_exposure_pct": 0.80,       # 80% deployed at once
     "max_trades_per_day": 25,             # Room for 20+ trades
     "min_risk_reward_ratio": 1.5,         # Slightly relaxed from 2:1
-    "min_confidence_to_trade": 0.50,      # Lower floor, confidence scaling handles the rest
+    "min_confidence_to_trade": 0.65,      # Raised from 0.50 — data shows <0.65 degrades PF
     "analyze_count": 10,                  # Symbols per cycle (filtered by pre-filter)
 }
 
@@ -158,19 +158,15 @@ If you find yourself holding on every stock in a cycle, look harder — there ar
 def _confidence_risk_scale(confidence: float) -> float:
     """Scale risk amount by confidence. Higher confidence = bigger bet.
 
-    0.50 confidence → 15% of max risk
-    0.60 confidence → 30% of max risk
-    0.70 confidence → 50% of max risk
-    0.80 confidence → 75% of max risk
-    0.90 confidence → 95% of max risk
+    0.65 confidence → 30% of max risk
+    0.70 confidence → 45% of max risk
+    0.80 confidence → 70% of max risk
+    0.90 confidence → 92% of max risk
     1.00 confidence → 100% of max risk
     """
-    # Quadratic scaling: starts small, ramps up fast at high confidence
-    # Clamp to [0.50, 1.0] range
-    c = max(0.50, min(1.0, confidence))
-    # Map 0.50-1.0 → 0.0-1.0, then square it and scale to 0.15-1.0
-    normalized = (c - 0.50) / 0.50
-    return 0.15 + 0.85 * (normalized ** 1.5)
+    c = max(0.65, min(1.0, confidence))
+    normalized = (c - 0.65) / 0.35
+    return 0.30 + 0.70 * (normalized ** 1.2)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -385,24 +381,46 @@ class BacktestEngine:
         spy_daily = fetch_spy_daily(self.start_date, self.end_date)
         vix_daily = fetch_vix_daily(self.start_date, self.end_date)
 
-        # 3. Build universe candidates — use scanner scoring on daily data
-        # For backtest, we use a fixed universe of high-liquidity names plus
-        # dynamically scored movers per day
-        universe = self._build_backtest_universe(trading_days)
+        # 3. Dynamic market scan — just like the live system
+        # Scan a broad universe of liquid stocks, score daily, pick each day's movers
+        broad_universe = self._build_broad_universe()
+        logger.info(f"Broad universe: {len(broad_universe)} liquid stocks")
 
-        # 4. Prefetch all 5m data for the universe
-        logger.info(f"Fetching 5-minute data for {len(universe)} symbols...")
-        bars_5m: dict[str, pd.DataFrame] = {}
+        # 4. Fetch daily bars for the broad universe (needed for scoring)
+        # This is fast — yfinance batch download, cached locally
+        logger.info(f"Fetching daily data for {len(broad_universe)} symbols...")
         daily_bars: dict[str, pd.DataFrame] = {}
-        for sym in universe:
-            bars_5m[sym] = fetch_5m_bars(sym, self.start_date, self.end_date)
+        for sym in broad_universe:
             daily_bars[sym] = fetch_daily_bars(sym, self.start_date, self.end_date)
-            if not bars_5m[sym].empty:
-                logger.debug(f"  {sym}: {len(bars_5m[sym])} 5m bars")
+        daily_bars = {s: d for s, d in daily_bars.items() if not d.empty}
+        logger.info(f"Daily data loaded for {len(daily_bars)} symbols")
 
-        # Filter to symbols with actual data
-        active_symbols = [s for s in universe if not bars_5m[s].empty and not daily_bars[s].empty]
-        logger.info(f"Active symbols with data: {len(active_symbols)}")
+        # 5. For each trading day, run the scanner to find that day's movers
+        # Then lazy-fetch 5m data only for stocks that make the cut
+        bars_5m: dict[str, pd.DataFrame] = {}  # Lazy-loaded cache
+        daily_hot_lists: dict[str, list[str]] = {}
+
+        for day_dt in trading_days:
+            day_str = day_dt.strftime("%Y-%m-%d")
+            # Score all stocks using prior-day data (no look-ahead)
+            hot_list = self._scan_for_day(day_dt, daily_bars)
+            daily_hot_lists[day_str] = hot_list
+
+            # Lazy-fetch 5m data for new symbols we haven't seen
+            for sym in hot_list:
+                if sym not in bars_5m:
+                    bars_5m[sym] = fetch_5m_bars(sym, self.start_date, self.end_date)
+
+        # Count unique symbols selected across all days
+        all_selected = set()
+        for syms in daily_hot_lists.values():
+            all_selected.update(syms)
+        logger.info(
+            f"Scanner selected {len(all_selected)} unique symbols across "
+            f"{len(trading_days)} days (5m data fetched for each)"
+        )
+
+        active_symbols = list(all_selected)  # Not used directly — each day uses its hot list
 
         # 5. Replay each trading day
         prev_equity = self.equity
@@ -419,10 +437,8 @@ class BacktestEngine:
             regime_multiplier = self._regime_size_multiplier(regime)
             regime_context = self._regime_context_str(regime)
 
-            # Find today's top candidates using scanner-like scoring
-            todays_candidates = self._score_candidates_for_day(
-                day_dt, active_symbols, daily_bars, bars_5m
-            )
+            # Use today's scanner hot list (already computed above)
+            todays_candidates = daily_hot_lists.get(day_str, [])
 
             if not todays_candidates:
                 # Track daily return
@@ -548,15 +564,20 @@ class BacktestEngine:
                         fill_price = float(bar["Open"]) + SLIPPAGE_PER_SHARE
                         order = pending_buys.pop(sym)
 
+                        # Widen stop by 15% of risk distance — Claude's stops
+                        # can be too tight for 5-min bar noise
+                        risk_dist = abs(fill_price - order["stop_loss"])
+                        buffered_stop = order["stop_loss"] - risk_dist * 0.15
+
                         # Verify stop still valid after slippage
-                        if fill_price <= order["stop_loss"]:
+                        if fill_price <= buffered_stop:
                             continue
 
                         self.positions[sym] = SimulatedPosition(
                             symbol=sym,
                             entry_price=fill_price,
                             quantity=order["qty"],
-                            stop_loss=order["stop_loss"],
+                            stop_loss=buffered_stop,
                             take_profit=order["take_profit"],
                             entry_time=current_time,
                             pattern=order["pattern"],
@@ -574,6 +595,11 @@ class BacktestEngine:
 
                 # Skip phases that block trading
                 if phase_config.get("size_multiplier", 1.0) <= 0:
+                    continue
+
+                # Block lunch phase from new entries — structurally low volume,
+                # wider spreads, mean reversion traps. Still manage existing positions.
+                if phase == "lunch":
                     continue
 
                 # Check daily loss halt
@@ -748,11 +774,14 @@ class BacktestEngine:
                         continue
 
                     # Confidence-based position sizing
-                    # Max risk = 20% of equity ($20k on $100k), scaled by confidence
                     conf_scale = _confidence_risk_scale(confidence)
                     phase_mult = phase_config.get("size_multiplier", 1.0)
-                    # Ensure lunch/open still trade, just smaller
-                    phase_mult = max(phase_mult, 0.40)
+                    # Open phase (9:30-10:00 ET) has highest edge — boost sizing 1.5x
+                    # Structurally: highest volume, clearest setups, most momentum
+                    if phase == "open":
+                        phase_mult = 1.5
+                    else:
+                        phase_mult = max(phase_mult, 0.40)
                     risk_amount = (
                         self.equity
                         * BACKTEST_RISK["max_risk_per_trade_pct"]
@@ -814,17 +843,18 @@ class BacktestEngine:
             if bar_high > pos.highest_price:
                 pos.highest_price = bar_high
 
-            # Check stop loss hit (bar low touched stop)
-            if bar_low <= pos.current_stop:
+            # Check stop loss — require CLOSE below stop (not just wick)
+            # This filters out noise wicks that briefly touch stop then reverse
+            if bar_close <= pos.current_stop:
                 exit_price = pos.current_stop - SLIPPAGE_PER_SHARE
                 self._close_position(sym, exit_price, current_time, "Stop loss hit")
                 continue
 
-            # Scale out at 1R
+            # Scale out at 1R — sell HALF for symmetric dollar capture
             if (pos.scale_out_stage == 0
                     and bar_high >= pos.r_target_1
                     and pos.shares_remaining > 1):
-                sell_qty = max(1, int(pos.quantity / 3))
+                sell_qty = max(1, int(pos.quantity / 2))  # Half position
                 actual_sell = min(sell_qty, pos.shares_remaining - 1)
                 if actual_sell > 0:
                     exit_price = pos.r_target_1 - SLIPPAGE_PER_SHARE
@@ -837,7 +867,7 @@ class BacktestEngine:
                         entry_price=pos.entry_price, exit_price=exit_price,
                         quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
                         entry_time=pos.entry_time, exit_time=current_time,
-                        exit_reason="Scale out 1R (1/3)",
+                        exit_reason="Scale out 1R (1/2)",
                         confidence=pos.confidence, slippage_cost=slippage,
                     ))
                     self.equity += pnl
@@ -847,14 +877,15 @@ class BacktestEngine:
                     pos.scale_out_stage = 1
                     pos.current_stop = pos.entry_price  # Move to breakeven
 
-            # Scale out at 2R
+            # Take profit at 1.5R on remaining — close entire position
+            # Data shows only 11% of positions reach 2R; 1.5R captures profit
+            # before time exits give it all back (+$5 avg time exit vs +$93 at 2R)
             elif (pos.scale_out_stage == 1
-                  and bar_high >= pos.r_target_2
-                  and pos.shares_remaining > 1):
-                sell_qty = max(1, int(pos.quantity / 3))
-                actual_sell = min(sell_qty, pos.shares_remaining - 1)
+                  and bar_high >= pos.entry_price + pos.risk_per_share * 1.5):
+                actual_sell = pos.shares_remaining
+                target_price = pos.entry_price + pos.risk_per_share * 1.5
                 if actual_sell > 0:
-                    exit_price = pos.r_target_2 - SLIPPAGE_PER_SHARE
+                    exit_price = target_price - SLIPPAGE_PER_SHARE
                     pnl = (exit_price - pos.entry_price) * actual_sell
                     slippage = SLIPPAGE_PER_SHARE * 2 * actual_sell
                     r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
@@ -864,19 +895,21 @@ class BacktestEngine:
                         entry_price=pos.entry_price, exit_price=exit_price,
                         quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
                         entry_time=pos.entry_time, exit_time=current_time,
-                        exit_reason="Scale out 2R (2/3)",
+                        exit_reason="Take profit 1.5R (close remaining)",
                         confidence=pos.confidence, slippage_cost=slippage,
                     ))
                     self.equity += pnl
                     self.daily_pnl += pnl
-                    pos.shares_remaining -= actual_sell
+                    pos.shares_remaining = 0
                     pos.realized_pnl += pnl
                     pos.scale_out_stage = 2
+                    del self.positions[sym]
+                    continue
 
-            # Trailing stop (after first scale-out)
+            # Trailing stop after 1R scale-out: trail at 1R from high, floor at breakeven
             if pos.scale_out_stage >= 1:
-                # Use 2% fixed trailing (ATR not available per bar in backtest)
-                trail_stop = pos.highest_price * 0.98
+                r_trail = pos.highest_price - pos.risk_per_share
+                trail_stop = max(r_trail, pos.entry_price)
                 if trail_stop > pos.current_stop:
                     pos.current_stop = trail_stop
 
@@ -1299,12 +1332,15 @@ JSON only:
         return regime
 
     def _regime_size_multiplier(self, regime: dict) -> float:
+        # Day trading is about intraday patterns, not overnight trend risk.
+        # Regime affects WHICH setups to favor, not bet size (much).
+        # Only extreme VIX (30+) warrants real size reduction.
         return {
             "bull_quiet": 1.0,
-            "bull_volatile": 0.70,
-            "bear_quiet": 0.50,
-            "bear_volatile": 0.25,
-        }.get(regime["regime"], 0.5)
+            "bull_volatile": 0.85,
+            "bear_quiet": 0.85,
+            "bear_volatile": 0.60,
+        }.get(regime["regime"], 0.85)
 
     def _regime_context_str(self, regime: dict) -> str:
         desc = {
@@ -1320,31 +1356,164 @@ JSON only:
             f"REGIME: {regime['regime'].upper().replace('_', ' ')} — {desc}"
         )
 
-    def _build_backtest_universe(self, trading_days: list) -> list[str]:
-        """Build universe of symbols to test.
+    def _build_broad_universe(self) -> list[str]:
+        """Build a broad universe of liquid US stocks — simulates scanning the whole market.
 
-        Uses high-liquidity names that are likely to show up in the scanner.
+        Uses Alpaca to get all tradeable US equities, then filters by price/volume
+        using yfinance batch downloads. Same logic as the live MarketScanner.build_universe().
+        Results are cached so subsequent runs don't re-download.
         """
-        # Core liquid names that would regularly appear in the scanner
-        core = [
-            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AMD",
-            "JPM", "BA", "NFLX", "DIS", "CRM", "PYPL", "SQ", "UBER",
-            "COIN", "PLTR", "SOFI", "RIVN", "NIO", "SNAP", "ROKU", "SHOP",
-            "ABNB", "DKNG", "MARA", "RIOT", "SMCI", "ARM", "MU", "AVGO",
-        ]
-        return core
+        import yfinance as yf
+        from autotrader.config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
 
-    def _score_candidates_for_day(
-        self, day_dt, symbols, daily_bars, bars_5m
-    ) -> list[str]:
-        """Score and rank candidates for a specific day using prior-day data."""
-        scores = {}
-        for sym in symbols:
-            daily = daily_bars.get(sym)
-            if daily is None or daily.empty:
+        # Cache keyed by backtest date range so different periods get different universes
+        cache_name = f"broad_universe_{self.start_date}_{self.end_date}.json"
+        cache_file = CLAUDE_CACHE_DIR.parent / "backtest_cache" / cache_name
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Use cached universe for this specific date range
+        if cache_file.exists():
+            try:
+                import json as _json
+                with open(cache_file) as f:
+                    cached = _json.load(f)
+                if len(cached) > 100:
+                    logger.info(f"Using cached broad universe for {self.start_date}-{self.end_date}: {len(cached)} symbols")
+                    return cached
+            except Exception:
+                pass
+
+        # Pull all tradeable US equities from Alpaca
+        logger.info("Building broad universe — scanning all Alpaca equities...")
+        try:
+            from alpaca.trading.client import TradingClient
+            from alpaca.trading.requests import GetAssetsRequest
+            from alpaca.trading.enums import AssetClass, AssetStatus
+
+            client = TradingClient(
+                api_key=ALPACA_API_KEY,
+                secret_key=ALPACA_SECRET_KEY,
+                paper=ALPACA_PAPER,
+            )
+            request = GetAssetsRequest(
+                asset_class=AssetClass.US_EQUITY,
+                status=AssetStatus.ACTIVE,
+            )
+            all_assets = client.get_all_assets(request)
+            symbols = [
+                a.symbol for a in all_assets
+                if a.tradable
+                and a.exchange in ("NASDAQ", "NYSE", "ARCA", "AMEX", "BATS")
+                and not any(c in a.symbol for c in "./-")
+                and len(a.symbol) <= 5
+            ]
+            logger.info(f"Found {len(symbols)} tradeable symbols from Alpaca")
+        except Exception as e:
+            logger.warning(f"Alpaca asset list failed: {e}. Using fallback universe.")
+            return self._fallback_universe()
+
+        # Filter by price/volume using data from the BACKTEST period (not today)
+        from autotrader.config import SCANNER
+        from datetime import datetime, timedelta
+        # Use the first 10 trading days of the backtest period for filtering
+        filter_start = (datetime.strptime(self.start_date, "%Y-%m-%d") - timedelta(days=14)).strftime("%Y-%m-%d")
+        filter_end = self.start_date
+        logger.info(f"Filtering universe using price/volume data from {filter_start} to {filter_end}")
+
+        universe = []
+        batch_size = 200
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            try:
+                data = yf.download(
+                    tickers=batch, start=filter_start, end=filter_end,
+                    interval="1d", progress=False, threads=True,
+                )
+                if data.empty:
+                    continue
+                for sym in batch:
+                    try:
+                        if len(batch) == 1:
+                            close = data["Close"]
+                            vol = data["Volume"]
+                        else:
+                            close = data["Close"][sym] if sym in data["Close"].columns else None
+                            vol = data["Volume"][sym] if sym in data["Volume"].columns else None
+                        if close is None or vol is None:
+                            continue
+                        close = close.dropna()
+                        vol = vol.dropna()
+                        if len(close) < 3:
+                            continue
+                        price = float(close.iloc[-1])
+                        avg_vol = float(vol.mean())
+                        if SCANNER["min_price"] <= price <= SCANNER["max_price"] and avg_vol >= SCANNER["min_avg_volume"]:
+                            universe.append(sym)
+                    except Exception:
+                        continue
+            except Exception:
                 continue
 
-            # Only use data up to prior day
+            if len(universe) >= 800:
+                break
+
+            if (i // batch_size) % 5 == 0 and i > 0:
+                logger.info(f"  Scanned {i}/{len(symbols)} symbols, {len(universe)} qualify so far...")
+
+        # Cache for future runs
+        try:
+            import json as _json
+            with open(cache_file, "w") as f:
+                _json.dump(universe, f)
+        except Exception:
+            pass
+
+        logger.info(f"Broad universe built: {len(universe)} liquid stocks")
+        return universe
+
+    def _fallback_universe(self) -> list[str]:
+        """Fallback if Alpaca API is unavailable — large static pool of liquid names."""
+        return [
+            # Mega cap tech
+            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AMD", "AVGO", "CRM",
+            "ORCL", "ADBE", "INTC", "CSCO", "QCOM", "TXN", "MU", "AMAT", "LRCX", "KLAC",
+            # High-beta / meme / retail favorites
+            "COIN", "PLTR", "SOFI", "RIVN", "NIO", "SNAP", "ROKU", "SHOP", "MARA", "RIOT",
+            "SMCI", "ARM", "DKNG", "ABNB", "SQ", "HOOD", "UPST", "AFRM", "LCID", "PLUG",
+            "FUBO", "IONQ", "RKLB", "JOBY", "APLD", "HIMS", "CLOV", "WISH", "BB", "NOK",
+            # Finance
+            "JPM", "BAC", "GS", "MS", "C", "WFC", "SCHW", "V", "MA", "PYPL",
+            # Consumer / media
+            "DIS", "NFLX", "UBER", "LYFT", "DASH", "ABNB", "BKNG", "EXPE", "MAR", "BA",
+            "F", "GM", "TGT", "WMT", "COST", "HD", "LOW", "NKE", "SBUX", "MCD",
+            # Healthcare / biotech
+            "MRNA", "PFE", "BNTX", "JNJ", "LLY", "ABBV", "BMY", "AMGN", "GILD", "REGN",
+            # Energy / materials
+            "XOM", "CVX", "OXY", "SLB", "HAL", "FSLR", "ENPH", "RUN", "FCX", "CLF",
+            # ETFs that act like stocks
+            "SPY", "QQQ", "IWM", "XLF", "XLE", "XLK", "ARKK", "SOXL", "TQQQ",
+        ]
+
+    def _scan_for_day(self, day_dt: datetime, daily_bars: dict[str, pd.DataFrame]) -> list[str]:
+        """Scan the broad universe for a specific day's movers.
+
+        Mirrors the live MarketScanner._score_stock() logic:
+        - RVOL (relative volume) — 35% weight
+        - Gap from prior close — 25% weight
+        - Momentum / daily change — 15% weight
+        - ATR volatility — 10% weight
+        - Multi-day trend — 8% weight
+        - Key level proximity — 7% weight
+
+        Uses ONLY prior-day data (no look-ahead).
+        Returns top 15 symbols for this day.
+        """
+        scores: dict[str, float] = {}
+
+        for sym, daily in daily_bars.items():
+            if daily.empty:
+                continue
+
             to_date = daily[daily.index < _tz_aware_timestamp(day_dt, daily.index)]
             if len(to_date) < 10:
                 continue
@@ -1352,48 +1521,102 @@ JSON only:
             try:
                 close = to_date["Close"]
                 volume = to_date["Volume"]
+                high = to_date["High"]
+                low = to_date["Low"]
+                openp = to_date["Open"]
+
                 price = float(close.iloc[-1])
-                prev_price = float(close.iloc[-2])
-                avg_vol = float(volume.tail(20).mean())
+                prev_close = float(close.iloc[-2])
+                today_open = float(openp.iloc[-1])
+                today_vol = float(volume.iloc[-1])
+                avg_vol = float(volume.iloc[-20:].mean()) if len(volume) >= 20 else float(volume.mean())
 
-                change_pct = (price - prev_price) / prev_price * 100
+                if price <= 0 or avg_vol <= 0:
+                    continue
 
-                # Score based on recent activity
-                score = 0
-                # Volatility (bigger moves = more opportunity)
-                if abs(change_pct) >= 3:
+                change_pct = (price - prev_close) / prev_close * 100
+                gap_pct = (today_open - prev_close) / prev_close * 100
+                rvol = today_vol / avg_vol if avg_vol > 0 else 0
+
+                # ATR as % of price
+                tr_data = pd.DataFrame({
+                    "hl": high - low,
+                    "hc": (high - close.shift(1)).abs(),
+                    "lc": (low - close.shift(1)).abs(),
+                })
+                tr = tr_data.max(axis=1)
+                atr = float(tr.iloc[-14:].mean()) if len(tr) >= 14 else float(tr.mean())
+                atr_pct = (atr / price) * 100
+
+                score = 0.0
+
+                # 1. RVOL (35% weight)
+                if rvol >= 5.0:
+                    score += 40
+                elif rvol >= 3.0:
+                    score += 30
+                elif rvol >= 2.0:
                     score += 20
-                elif abs(change_pct) >= 1.5:
+                elif rvol >= 1.5:
                     score += 10
 
-                # 5-day trend
+                # 2. Gap (25% weight)
+                abs_gap = abs(gap_pct)
+                if abs_gap >= 8.0:
+                    score += 30
+                elif abs_gap >= 4.0:
+                    score += 22
+                elif abs_gap >= 2.0:
+                    score += 12
+
+                # Gap + volume combo
+                if abs_gap >= 3.0 and rvol >= 2.0:
+                    score += 15
+
+                # 3. Daily change / momentum (15%)
+                abs_change = abs(change_pct)
+                if abs_change >= 5.0:
+                    score += 18
+                elif abs_change >= 3.0:
+                    score += 12
+                elif abs_change >= 1.5:
+                    score += 6
+
+                # 4. ATR volatility (10%)
+                if atr_pct >= 4.0:
+                    score += 12
+                elif atr_pct >= 2.5:
+                    score += 8
+                elif atr_pct >= 1.5:
+                    score += 4
+
+                # 5. Multi-day trend (8%)
                 if len(close) >= 5:
                     five_day = (price - float(close.iloc[-5])) / float(close.iloc[-5]) * 100
-                    if abs(five_day) >= 8:
-                        score += 15
+                    if abs(five_day) >= 15:
+                        score += 10
+                    elif abs(five_day) >= 8:
+                        score += 6
 
-                # Near 20-day high/low
+                # 6. Key level proximity (7%)
                 if len(to_date) >= 20:
-                    high_20 = float(to_date["High"].tail(20).max())
-                    low_20 = float(to_date["Low"].tail(20).min())
+                    high_20 = float(high.tail(20).max())
+                    low_20 = float(low.tail(20).min())
                     if price >= high_20 * 0.97:
-                        score += 10
+                        score += 8
                     if price <= low_20 * 1.03:
-                        score += 10
+                        score += 8
 
-                # Volume spike
-                if avg_vol > 0:
-                    last_vol = float(volume.iloc[-1])
-                    if last_vol / avg_vol >= 2.0:
-                        score += 15
+                # Only include if something is happening
+                if score > 0:
+                    scores[sym] = score
 
-                scores[sym] = score
             except Exception:
                 continue
 
-        # Return top 20 by score
+        # Return top 15 by score (matches live scanner behavior)
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return [sym for sym, _ in ranked[:20]]
+        return [sym for sym, _ in ranked[:15]]
 
     def _check_sector_ok(self, symbol: str) -> bool:
         """Check sector concentration against current positions."""

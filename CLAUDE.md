@@ -211,9 +211,10 @@ Reports run daily (logged) and weekly (Telegram).
 3. At scheduled analysis times, feeds Claude the same indicators, patterns, key levels, VWAP from 5-min data
 4. Applies phase-specific confidence thresholds, position sizing multipliers, and pattern preferences
 5. Applies regime-aware sizing (SPY trend + VIX level from prior close)
-6. Fills buy orders at next bar's open + $0.02/share slippage
-7. Runs full PositionManager: scale-out 1/3 at 1R, 1/3 at 2R, 2% trailing stop on remainder
+6. Fills buy orders at next bar's open + $0.01/share slippage
+7. Scale-out: 1/2 at 1R (move stop to BE), remaining exits at 1.5R or trails; close-based stops (not wick)
 8. Time exits: half at 30 min to close, full at 15 min, force-close at 3:50 PM ET
+9. Midday throttle: lunch phase (11 AM - 1:30 PM ET) blocked from new entries (low edge, structural)
 9. Enforces all risk limits: 2% daily loss halt, 3-loss cooldown, sector concentration, 40% max exposure
 
 ### Cost management
@@ -238,6 +239,16 @@ python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-28 --model
 - Profit factor > 1.3: required
 - Max drawdown < 8%: required
 - Sharpe > 0.75: required
+
+### Backtesting Principles (MUST follow when tuning)
+
+**DO NOT overfit to the backtest period.** Every change must be justified by structural logic, not by "symbol X lost money in March." The system trades dynamically across all symbols, all market conditions, all time periods. Specifically:
+
+1. **Never filter by specific symbol.** Symbols rotate. A loser in March may be the best setup in April. The scanner and Claude handle symbol selection — don't hardcode winners/losers.
+2. **Never tune parameters to a specific date range.** If a change helps March but would hurt January, it's overfitting. Changes must be structurally sound (e.g., "close-based stops reduce noise false-outs" is structural; "remove RIOT because it lost $158" is overfitting).
+3. **Position management changes must be mathematically justified.** Show the win-rate / payoff-ratio math. If the system has 55% position WR, position management must be profitable at 55% WR — not just at 67%.
+4. **Phase/time-of-day rules should reflect market microstructure**, not backtest P&L. "Midday has lower volume and wider spreads" is structural. "11 AM lost money in March" is noise.
+5. **Always re-run after changes.** Cached Claude responses make this fast. If a change doesn't improve results on cached data, it won't help live either.
 
 ### Output
 - Console: full metrics, pattern breakdown, phase breakdown, PASS/FAIL
