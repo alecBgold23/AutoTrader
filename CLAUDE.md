@@ -32,14 +32,15 @@ autotrader/
     stalker.py                  # EntryStalker — limit order management for patient entries
   risk/
     manager.py                  # RiskManager — all risk checks, position sizing, circuit breakers
-    position_manager.py         # PositionManager — trailing stops, scale-outs (1/3 at 1R, 1/3 at 2R)
+    position_manager.py         # PositionManager — trailing stops, scale-outs (live: 1/3 at 1R, 1/3 at 2R; backtest: 1/2 at 1R, close at 1.5R)
   alerts/
     telegram.py                 # TelegramAlerts — trade notifications, daily summaries
   analytics/
     performance.py              # Performance tracking — metrics by pattern, phase, day, rolling 20
   backtest/
-    engine.py                   # Backtest engine — replay historical days through trading logic
-    runner.py                   # CLI: python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-01
+    engine.py                   # Backtest engine — dynamic market scanning, bar-by-bar replay with Claude analysis
+    data_fetcher.py             # Fetches 5-min bars (Alpaca) + daily bars (yfinance), cached as CSV
+    runner.py                   # CLI: python -m autotrader.backtest.runner --start 2024-12-02 --end 2025-02-28
   db/
     models.py                   # SQLAlchemy models (Trade, Decision, PortfolioSnapshot, RiskEvent, TradingJournal)
 scripts/
@@ -202,37 +203,63 @@ Reports run daily (logged) and weekly (Telegram).
 
 ### Architecture
 - `data_fetcher.py` — Fetches 5-min bars from Alpaca, daily bars from yfinance, cached as CSV in `data/backtest_cache/`
-- `engine.py` — Core replay engine: bar-by-bar simulation with Claude analysis, position management, risk checks
+- `engine.py` — Core replay engine: dynamic market scanning, bar-by-bar simulation with Claude analysis, position management, risk checks
 - `runner.py` — CLI interface
 
+### Dynamic Market Scanning
+The backtest simulates real market scanning — not a hardcoded stock list:
+1. Pulls ALL ~12,000 Alpaca tradeable US equities
+2. Filters by price ($5-$1000) and avg volume (500k+) using data from the backtest period (not today) → ~800 liquid stocks
+3. Each trading day, scores all ~800 using prior-day data: RVOL (35%), Gap (25%), Momentum (15%), ATR (10%), Trend (8%), Key levels (7%)
+4. Selects top 15 movers per day — different stocks every day, just like a real scanner
+5. Lazy-fetches 5m data only for symbols that make the daily hot list
+6. Universe cache is keyed by date range so different backtest periods get different universes
+
 ### What it simulates
-1. Builds universe and scores candidates using prior-day data (no look-ahead)
+1. Builds period-aware universe and scores candidates using prior-day data (no look-ahead)
 2. Steps through each trading day in 5-minute increments starting at 9:30 AM ET
 3. At scheduled analysis times, feeds Claude the same indicators, patterns, key levels, VWAP from 5-min data
 4. Applies phase-specific confidence thresholds, position sizing multipliers, and pattern preferences
 5. Applies regime-aware sizing (SPY trend + VIX level from prior close)
 6. Fills buy orders at next bar's open + $0.01/share slippage
-7. Scale-out: 1/2 at 1R (move stop to BE), remaining exits at 1.5R or trails; close-based stops (not wick)
-8. Time exits: half at 30 min to close, full at 15 min, force-close at 3:50 PM ET
-9. Midday throttle: lunch phase (11 AM - 1:30 PM ET) blocked from new entries (low edge, structural)
-9. Enforces all risk limits: 2% daily loss halt, 3-loss cooldown, sector concentration, 40% max exposure
+7. Close-based stops (bar close below stop, not wick touching) with 15% stop buffer for 5-min noise
+8. Scale-out: 1/2 at 1R (move stop to BE), close remaining at 1.5R; trailing stop after 1R
+9. Time exits: half at 30 min to close, full at 15 min, force-close at 3:50 PM ET
+10. Lunch phase (11 AM - 1:30 PM ET) blocked from new entries (structural: low volume, wide spreads)
+11. Enforces all risk limits: 2% daily loss halt, 3-loss cooldown, sector concentration, 80% max exposure
+
+### Backtest-Specific Risk Parameters
+These are tuned separately from live (pending sync after 60-day validation):
+- Max risk per trade: 15% of equity (day trading, flat by EOD)
+- Max single position: 20% of equity ($20k on $100k)
+- Max total exposure: 80%
+- Min confidence: 0.65
+- Min R:R: 1.5:1
+- Slippage: $0.01/share (realistic for liquid large/mid-caps)
+- Regime multiplier flattened for day trading (bear_quiet: 0.85x vs live 0.50x)
+- Open phase 1.5x sizing boost
 
 ### Cost management
 - Claude responses cached in `data/claude_cache/` (keyed by symbol + date + time + price + volume)
 - `--model` flag: defaults to `claude-haiku-4-5-20251001` for cheap bulk runs
-- `--max-cycles-per-day` flag: defaults to 6 (open, 10:00, 10:30, 11:30, 2:00, 3:15)
+- `--max-cycles-per-day` flag: defaults to 10
+- First run for a new date range is slow (fresh API calls); subsequent re-runs are near-instant (fully cached)
 
 ### Usage
 ```bash
-# 20-day test on Haiku (verify engine works)
+# 20-day test (fast, good for iterating)
 python -m autotrader.backtest.runner --start 2025-03-01 --end 2025-03-28 --model claude-haiku-4-5-20251001
 
-# Full 60-day validation
-python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-28 --model claude-haiku-4-5-20251001 --max-cycles-per-day 6
+# 60-day validation (different period, no overlap)
+python -m autotrader.backtest.runner --start 2024-12-02 --end 2025-02-28 --model claude-haiku-4-5-20251001 --max-cycles-per-day 10
 
 # Final Sonnet run
-python -m autotrader.backtest.runner --start 2025-01-02 --end 2025-03-28 --model claude-sonnet-4-20250514
+python -m autotrader.backtest.runner --start 2024-12-02 --end 2025-02-28 --model claude-sonnet-4-20250514
 ```
+
+### Latest Results
+- **20-day (Mar 2025)**: +$5,065 (+5.07%), 167 trades, 52.7% WR, 1.64 PF, 6.83 Sharpe, 0.57% max DD
+- **60-day (Dec 2024-Feb 2025)**: Running...
 
 ### PASS/FAIL thresholds
 - 200+ trades: required
@@ -352,6 +379,8 @@ Claude sees "{trades_today}/8 trades used" and is taught to pace itself.
 
 ## Known Issues / Not Yet Configured
 
+- **Live ≠ Backtest parameters** — Backtest has tuned parameters (1/2 scale-outs, close-based stops, 15% risk, lunch blocking, flattened regime) that haven't been ported to live code yet. Live still uses conservative 1% risk, 1/3 scale-outs, wick-based stops. Pending sync after 60-day backtest validation.
+- **launchd import error** — `alpaca.data.news.NewsClient` module not found on launchd restart. The Friday process (manual `run.py`) works fine. Need to fix the launchd plist Python/venv path.
 - **Telegram** not configured — alerts are silently skipped
 - **No shorting** — System is long-only. SELL signals on unowned stocks are skipped.
 - **Scanner uses yfinance batch downloads** — Can be slow on initial universe build (~2-3 min for 800 stocks)
