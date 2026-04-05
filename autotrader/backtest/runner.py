@@ -33,6 +33,16 @@ def main():
     )
     parser.add_argument("--equity", type=float, default=100_000, help="Starting equity (default: 100000)")
     parser.add_argument("--max-trades", type=int, default=25, help="Max trades per day (default: 25)")
+    parser.add_argument(
+        "--claude",
+        action="store_true",
+        help="Use Claude API for decisions instead of deterministic engine (legacy mode)",
+    )
+    parser.add_argument(
+        "--optimize",
+        action="store_true",
+        help="Run walk-forward parameter optimization",
+    )
 
     args = parser.parse_args()
 
@@ -46,13 +56,29 @@ def main():
     for lib in ("httpx", "httpcore", "urllib3", "yfinance", "alpaca"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
+    deterministic = not args.claude
+    mode_str = "Claude API" if args.claude else "Deterministic Engine"
+
     print(f"\n{'='*60}")
     print(f"  AutoTrader Intraday Backtest (5-minute bars)")
     print(f"  {args.start} → {args.end}")
-    print(f"  Model: {args.model}")
+    print(f"  Mode: {mode_str}")
+    if args.claude:
+        print(f"  Model: {args.model}")
     print(f"  Cycles/day: {args.max_cycles_per_day}")
     print(f"  Starting equity: ${args.equity:,.0f}")
     print(f"{'='*60}\n")
+
+    # Walk-forward optimization mode
+    if args.optimize:
+        from autotrader.backtest.optimizer import WalkForwardOptimizer
+        optimizer = WalkForwardOptimizer(
+            full_start=args.start,
+            full_end=args.end,
+            n_windows=4,
+        )
+        optimizer.run()
+        return
 
     engine = BacktestEngine(
         start=args.start,
@@ -61,6 +87,7 @@ def main():
         model=args.model,
         max_cycles_per_day=args.max_cycles_per_day,
         max_trades_per_day=args.max_trades,
+        deterministic=deterministic,
     )
 
     result = engine.run()
@@ -86,7 +113,8 @@ def main():
     summary = {
         "start_date": result.start_date,
         "end_date": result.end_date,
-        "model": args.model,
+        "mode": mode_str,
+        "model": args.model if args.claude else "deterministic",
         "max_cycles_per_day": args.max_cycles_per_day,
         "trading_days": result.trading_days,
         "total_trades": result.total_trades,
@@ -104,6 +132,7 @@ def main():
         "avg_win": round(result.avg_win, 2),
         "avg_loss": round(result.avg_loss, 2),
         "total_slippage": round(result.total_slippage, 2),
+        "total_costs": round(result.total_costs, 2),
         "api_calls": result.api_calls,
         "cache_hits": result.cache_hits,
         "passes_minimum_bar": result.passes_minimum_bar,
@@ -124,6 +153,9 @@ def main():
                 "exit_reason": t.exit_reason,
                 "confidence": round(t.confidence, 2),
                 "market_phase": t.market_phase,
+                "trading_costs": round(t.trading_costs, 2),
+                "mae": round(t.mae, 4),
+                "mfe": round(t.mfe, 4),
             }
             for t in result.trades
         ],

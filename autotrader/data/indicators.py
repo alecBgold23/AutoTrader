@@ -2,8 +2,9 @@
 
 import logging
 
+import numpy as np
 import pandas as pd
-from ta.trend import SMAIndicator, EMAIndicator, MACD, IchimokuIndicator
+from ta.trend import SMAIndicator, EMAIndicator, MACD, IchimokuIndicator, ADXIndicator
 from ta.momentum import RSIIndicator, StochRSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume import OnBalanceVolumeIndicator, VolumeWeightedAveragePrice
@@ -395,3 +396,54 @@ def _atr_pct(atr_series, close):
     if atr_val and price and price > 0:
         return round((atr_val / price) * 100, 2)
     return None
+
+
+def calculate_choppiness_index(df: pd.DataFrame, period: int = 14) -> float | None:
+    """Calculate Choppiness Index (CHOP) from OHLCV data.
+
+    CHOP > 61.8 = choppy/range-bound market
+    CHOP < 38.2 = strongly trending market
+    """
+    if df is None or df.empty or len(df) < period + 1:
+        return None
+    try:
+        high = df["High"]
+        low = df["Low"]
+        close = df["Close"]
+
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+
+        atr_sum = tr.iloc[-period:].sum()
+        hh = float(high.iloc[-period:].max())
+        ll = float(low.iloc[-period:].min())
+
+        if hh <= ll or atr_sum <= 0:
+            return None
+
+        chop = 100.0 * np.log10(atr_sum / (hh - ll)) / np.log10(period)
+        return round(float(chop), 2)
+    except Exception:
+        return None
+
+
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> float | None:
+    """Calculate ADX (Average Directional Index) from OHLCV data.
+
+    ADX < 20 = weak/no trend
+    ADX > 25 = strong trend
+    """
+    if df is None or df.empty or len(df) < period + 10:
+        return None
+    try:
+        adx = ADXIndicator(df["High"], df["Low"], df["Close"], window=period)
+        val = adx.adx().iloc[-1]
+        if pd.isna(val):
+            return None
+        return round(float(val), 2)
+    except Exception:
+        return None

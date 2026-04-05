@@ -26,7 +26,7 @@ from autotrader.config import BASE_DIR, RISK, PHASE_CONFIG
 
 logger = logging.getLogger(__name__)
 
-SLIPPAGE_PER_SHARE = 0.01  # $0.01/share — realistic for liquid large/mid-caps
+SLIPPAGE_PER_SHARE = 0.01  # $0.01/share — realistic for liquid large/mid-caps (legacy, see CostModel)
 CLAUDE_CACHE_DIR = BASE_DIR / "data" / "claude_cache"
 CLAUDE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -155,6 +155,35 @@ BUY when you see a setup. HOLD only when there is genuinely no pattern forming.
 If you find yourself holding on every stock in a cycle, look harder — there are always setups if you look for the right type (momentum in bull markets, reversals in bear markets)."""
 
 
+_MOMENTUM_PATTERNS = {
+    "orb", "orb breakout", "opening range breakout",
+    "vwap reclaim", "vwap breakout",
+    "flag", "flag breakout", "bull flag",
+    "hod break", "high of day",
+    "gap and go", "gap up",
+    "first pullback", "pullback",
+    "ema trend", "ema crossover",
+    "breakout", "momentum", "continuation",
+    "red to green", "power hour momentum",
+}
+
+
+def _is_momentum_pattern(pattern: str) -> bool:
+    """Classify a pattern as momentum vs mean-reversion.
+
+    Momentum patterns need follow-through and volume; they fail in choppy markets.
+    Everything not explicitly momentum is treated as MR (more conservative default).
+    """
+    if not pattern:
+        return True  # Unknown patterns default to momentum (more conservative filtering)
+    p = pattern.lower().strip()
+    # Check if any momentum keyword appears in the pattern string
+    for mom in _MOMENTUM_PATTERNS:
+        if mom in p:
+            return True
+    return False
+
+
 def _confidence_risk_scale(confidence: float) -> float:
     """Scale risk amount by confidence. Higher confidence = bigger bet.
 
@@ -167,6 +196,52 @@ def _confidence_risk_scale(confidence: float) -> float:
     c = max(0.65, min(1.0, confidence))
     normalized = (c - 0.65) / 0.35
     return 0.30 + 0.70 * (normalized ** 1.2)
+
+
+# ═══════════════════════════════════════════════════════════
+# COST MODEL
+# ═══════════════════════════════════════════════════════════
+
+
+class CostModel:
+    """Models all real trading costs for US equities via Alpaca."""
+
+    SLIPPAGE_PER_SHARE = 0.01          # $0.01/share slippage
+    SEC_FEE_RATE = 0.0000278           # $27.80 per million (sells only)
+    TAF_FEE_PER_SHARE = 0.000166       # FINRA TAF fee per share
+    EXCHANGE_FEE_PER_SHARE = 0.003     # Average exchange fee
+
+    @classmethod
+    def entry_cost(cls, price: float, shares: int) -> float:
+        """Total cost to enter a position."""
+        slippage = cls.SLIPPAGE_PER_SHARE * shares
+        taf = cls.TAF_FEE_PER_SHARE * shares
+        exchange = cls.EXCHANGE_FEE_PER_SHARE * shares
+        return slippage + taf + exchange
+
+    @classmethod
+    def exit_cost(cls, price: float, shares: int) -> float:
+        """Total cost to exit a position."""
+        slippage = cls.SLIPPAGE_PER_SHARE * shares
+        sec = price * shares * cls.SEC_FEE_RATE
+        taf = cls.TAF_FEE_PER_SHARE * shares
+        exchange = cls.EXCHANGE_FEE_PER_SHARE * shares
+        return slippage + sec + taf + exchange
+
+    @classmethod
+    def round_trip_cost(cls, entry_price: float, exit_price: float, shares: int) -> float:
+        """Total round-trip cost."""
+        return cls.entry_cost(entry_price, shares) + cls.exit_cost(exit_price, shares)
+
+    @classmethod
+    def effective_entry(cls, price: float, shares: int) -> float:
+        """Price you effectively pay (higher than market)."""
+        return price + cls.entry_cost(price, shares) / shares if shares > 0 else price
+
+    @classmethod
+    def effective_exit(cls, price: float, shares: int) -> float:
+        """Price you effectively receive (lower than market)."""
+        return price - cls.exit_cost(price, shares) / shares if shares > 0 else price
 
 
 # ═══════════════════════════════════════════════════════════
@@ -202,19 +277,29 @@ class SimulatedPosition:
     confidence: float = 0.0
     risk_per_share: float = 0.0
     highest_price: float = 0.0
+    lowest_price: float = 0.0
     scale_out_stage: int = 0
     shares_remaining: int = 0
     realized_pnl: float = 0.0
     r_target_1: float = 0.0
     r_target_2: float = 0.0
     current_stop: float = 0.0
+    # MAE/MFE tracking (Phase 3)
+    mae: float = 0.0           # Maximum adverse excursion (worst drawdown % from entry)
+    mfe: float = 0.0           # Maximum favorable excursion (best unrealized gain % from entry)
+    mae_time: datetime | None = None
+    mfe_time: datetime | None = None
+
+    # Phase 6: Adaptive exit tracking
+    breakeven_locked: bool = False  # True once stop moved to breakeven
 
     def __post_init__(self):
         self.risk_per_share = abs(self.entry_price - self.stop_loss)
         self.highest_price = self.entry_price
+        self.lowest_price = self.entry_price
         self.shares_remaining = self.quantity
-        self.r_target_1 = self.entry_price + self.risk_per_share
-        self.r_target_2 = self.entry_price + self.risk_per_share * 2
+        self.r_target_1 = self.entry_price + self.risk_per_share * 0.5  # Phase 6: 0.5R first target (was 1R)
+        self.r_target_2 = self.entry_price + self.risk_per_share * 1.5  # Phase 6: 1.5R second target (was 2R)
         self.current_stop = self.stop_loss
 
 
@@ -233,6 +318,9 @@ class BacktestTrade:
     confidence: float = 0.0
     market_phase: str = ""
     slippage_cost: float = 0.0
+    trading_costs: float = 0.0   # Phase 2: realistic round-trip costs
+    mae: float = 0.0             # Phase 3: max adverse excursion %
+    mfe: float = 0.0             # Phase 3: max favorable excursion %
 
 
 @dataclass
@@ -246,6 +334,7 @@ class BacktestResult:
     total_pnl: float = 0.0
     total_r: float = 0.0
     total_slippage: float = 0.0
+    total_costs: float = 0.0      # Phase 2: total trading costs (slippage + fees)
     max_drawdown_pct: float = 0.0
     starting_equity: float = 100_000.0
     ending_equity: float = 100_000.0
@@ -331,6 +420,8 @@ class BacktestEngine:
         model: str = "claude-haiku-4-5-20251001",
         max_cycles_per_day: int = 10,
         max_trades_per_day: int = 25,
+        deterministic: bool = True,
+        signal_params: dict | None = None,
     ):
         self.start_date = start
         self.end_date = end
@@ -339,6 +430,12 @@ class BacktestEngine:
         self.model = model
         self.max_cycles_per_day = max_cycles_per_day
         self.max_trades_per_day = max_trades_per_day
+        self.deterministic = deterministic
+
+        # Initialize signal engine for deterministic mode
+        if self.deterministic:
+            from autotrader.signals.engine import SignalEngine
+            self.signal_engine = SignalEngine(params=signal_params)
 
         self.positions: dict[str, SimulatedPosition] = {}
         self.completed_trades: list[BacktestTrade] = []
@@ -354,62 +451,95 @@ class BacktestEngine:
         self.daily_trades = 0
         self.daily_pnl = 0.0
 
+        # Pattern-level performance tracking (rolling window for dynamic suppression)
+        self.pattern_performance: dict[str, list[float]] = {}
+
         # Analysis times (trimmed to max_cycles_per_day)
         self.analysis_times = DEFAULT_ANALYSIS_TIMES[:max_cycles_per_day]
 
-    def run(self) -> BacktestResult:
-        """Run the full intraday backtest."""
+    def run(self, preloaded_data: dict | None = None) -> BacktestResult:
+        """Run the full intraday backtest.
+
+        Args:
+            preloaded_data: Optional dict with pre-fetched data to avoid redundant
+                API calls (used by walk-forward optimizer). Keys:
+                - trading_days, spy_daily, vix_daily, daily_bars, bars_5m, daily_hot_lists
+        """
         from autotrader.backtest.data_fetcher import (
             fetch_5m_bars, fetch_daily_bars, fetch_spy_daily,
             fetch_vix_daily, get_trading_days,
         )
 
+        mode = "DETERMINISTIC" if self.deterministic else f"Claude ({self.model})"
         logger.info(
             f"Backtest: {self.start_date} to {self.end_date} | "
-            f"Model: {self.model} | Cycles/day: {self.max_cycles_per_day}"
+            f"Mode: {mode} | Cycles/day: {self.max_cycles_per_day}"
         )
 
-        # 1. Get trading days
-        trading_days = get_trading_days(self.start_date, self.end_date)
-        if not trading_days:
-            logger.error("No trading days found in range")
-            return self._build_result(0)
+        if preloaded_data:
+            # Use pre-loaded data (walk-forward optimization mode)
+            all_trading_days = preloaded_data["trading_days"]
+            spy_daily = preloaded_data["spy_daily"]
+            vix_daily = preloaded_data["vix_daily"]
+            daily_bars = preloaded_data["daily_bars"]
+            bars_5m = preloaded_data["bars_5m"]
+            all_hot_lists = preloaded_data["daily_hot_lists"]
 
-        logger.info(f"Found {len(trading_days)} trading days")
+            # Filter trading days to this engine's date range
+            start_dt = pd.Timestamp(self.start_date)
+            end_dt = pd.Timestamp(self.end_date)
+            trading_days = [d for d in all_trading_days
+                           if start_dt <= pd.Timestamp(d.strftime("%Y-%m-%d")) <= end_dt]
 
-        # 2. Prefetch SPY/VIX daily for regime
-        spy_daily = fetch_spy_daily(self.start_date, self.end_date)
-        vix_daily = fetch_vix_daily(self.start_date, self.end_date)
+            if not trading_days:
+                return self._build_result(0)
 
-        # 3. Dynamic market scan — just like the live system
-        # Scan a broad universe of liquid stocks, score daily, pick each day's movers
-        broad_universe = self._build_broad_universe()
-        logger.info(f"Broad universe: {len(broad_universe)} liquid stocks")
+            logger.info(f"Using preloaded data: {len(trading_days)} trading days")
 
-        # 4. Fetch daily bars for the broad universe (needed for scoring)
-        # This is fast — yfinance batch download, cached locally
-        logger.info(f"Fetching daily data for {len(broad_universe)} symbols...")
-        daily_bars: dict[str, pd.DataFrame] = {}
-        for sym in broad_universe:
-            daily_bars[sym] = fetch_daily_bars(sym, self.start_date, self.end_date)
-        daily_bars = {s: d for s, d in daily_bars.items() if not d.empty}
-        logger.info(f"Daily data loaded for {len(daily_bars)} symbols")
+            # Filter hot lists to this date range
+            daily_hot_lists = {}
+            for day_dt in trading_days:
+                day_str = day_dt.strftime("%Y-%m-%d")
+                daily_hot_lists[day_str] = all_hot_lists.get(day_str, [])
+        else:
+            # Normal mode: fetch all data
+            # 1. Get trading days
+            trading_days = get_trading_days(self.start_date, self.end_date)
+            if not trading_days:
+                logger.error("No trading days found in range")
+                return self._build_result(0)
 
-        # 5. For each trading day, run the scanner to find that day's movers
-        # Then lazy-fetch 5m data only for stocks that make the cut
-        bars_5m: dict[str, pd.DataFrame] = {}  # Lazy-loaded cache
-        daily_hot_lists: dict[str, list[str]] = {}
+            logger.info(f"Found {len(trading_days)} trading days")
 
-        for day_dt in trading_days:
-            day_str = day_dt.strftime("%Y-%m-%d")
-            # Score all stocks using prior-day data (no look-ahead)
-            hot_list = self._scan_for_day(day_dt, daily_bars)
-            daily_hot_lists[day_str] = hot_list
+            # 2. Prefetch SPY/VIX daily for regime
+            spy_daily = fetch_spy_daily(self.start_date, self.end_date)
+            vix_daily = fetch_vix_daily(self.start_date, self.end_date)
 
-            # Lazy-fetch 5m data for new symbols we haven't seen
-            for sym in hot_list:
-                if sym not in bars_5m:
-                    bars_5m[sym] = fetch_5m_bars(sym, self.start_date, self.end_date)
+            # 3. Dynamic market scan — just like the live system
+            broad_universe = self._build_broad_universe()
+            logger.info(f"Broad universe: {len(broad_universe)} liquid stocks")
+
+            # 4. Fetch daily bars for the broad universe
+            logger.info(f"Fetching daily data for {len(broad_universe)} symbols...")
+            daily_bars: dict[str, pd.DataFrame] = {}
+            for sym in broad_universe:
+                daily_bars[sym] = fetch_daily_bars(sym, self.start_date, self.end_date)
+            daily_bars = {s: d for s, d in daily_bars.items() if not d.empty}
+            logger.info(f"Daily data loaded for {len(daily_bars)} symbols")
+
+            # 5. For each trading day, run the scanner to find that day's movers
+            bars_5m: dict[str, pd.DataFrame] = {}
+            daily_hot_lists: dict[str, list[str]] = {}
+
+            for day_dt in trading_days:
+                day_str = day_dt.strftime("%Y-%m-%d")
+                hot_list = self._scan_for_day(day_dt, daily_bars)
+                daily_hot_lists[day_str] = hot_list
+
+                # Lazy-fetch 5m data for new symbols we haven't seen
+                for sym in hot_list:
+                    if sym not in bars_5m:
+                        bars_5m[sym] = fetch_5m_bars(sym, self.start_date, self.end_date)
 
         # Count unique symbols selected across all days
         all_selected = set()
@@ -732,41 +862,67 @@ class BacktestEngine:
                     if not self._check_sector_ok(sym):
                         continue
 
-                    # Technical pre-filter: skip boring setups before paying for Claude
-                    if not self._should_call_claude(price_data, indicators, patterns_text):
-                        continue
+                    # ── Deterministic signal engine vs Claude ──
+                    if self.deterministic:
+                        # Use deterministic signal engine (no API calls)
+                        sig_decision = self.signal_engine.score(
+                            symbol=sym,
+                            price_data=price_data,
+                            indicators=indicators,
+                            intraday_indicators=intraday_indicators,
+                            patterns_text=patterns_text,
+                            levels=key_levels,
+                            phase=phase,
+                            regime=regime.get("label", "unknown"),
+                        )
 
-                    # Ask Claude
-                    decision = self._ask_claude(
-                        symbol=sym,
-                        price_data=price_data,
-                        indicators=indicators,
-                        signal_summary=signal_summary,
-                        intraday_summary=intraday_summary,
-                        portfolio=portfolio,
-                        scanner_flags=scanner_flags,
-                        patterns_text=patterns_text,
-                        levels_text=levels_text,
-                        phase=phase,
-                        regime_context=regime_context,
-                        day_str=day_str,
-                        time_str=f"{hour:02d}{minute:02d}",
-                    )
+                        if sig_decision.action != "BUY":
+                            continue
 
-                    if not decision:
-                        continue
+                        action = sig_decision.action
+                        confidence = sig_decision.confidence
+                        stop_loss = sig_decision.stop_loss
+                        take_profit = sig_decision.take_profit
+                        pattern = sig_decision.pattern
+                        reasoning = sig_decision.reasoning
+                    else:
+                        # Technical pre-filter: skip boring setups before paying for Claude
+                        if not self._should_call_claude(price_data, indicators, patterns_text):
+                            continue
 
-                    action = decision.get("action", "HOLD").upper()
-                    confidence = float(decision.get("confidence", 0))
-                    stop_loss = decision.get("stop_loss")
-                    take_profit = decision.get("take_profit")
+                        # Ask Claude
+                        decision = self._ask_claude(
+                            symbol=sym,
+                            price_data=price_data,
+                            indicators=indicators,
+                            signal_summary=signal_summary,
+                            intraday_summary=intraday_summary,
+                            portfolio=portfolio,
+                            scanner_flags=scanner_flags,
+                            patterns_text=patterns_text,
+                            levels_text=levels_text,
+                            phase=phase,
+                            regime_context=regime_context,
+                            day_str=day_str,
+                            time_str=f"{hour:02d}{minute:02d}",
+                        )
 
-                    # Validate BUY
-                    if action != "BUY" or not stop_loss or not take_profit:
-                        continue
+                        if not decision:
+                            continue
 
-                    stop_loss = float(stop_loss)
-                    take_profit = float(take_profit)
+                        action = decision.get("action", "HOLD").upper()
+                        confidence = float(decision.get("confidence", 0))
+                        stop_loss = decision.get("stop_loss")
+                        take_profit = decision.get("take_profit")
+
+                        # Validate BUY
+                        if action != "BUY" or not stop_loss or not take_profit:
+                            continue
+
+                        stop_loss = float(stop_loss)
+                        take_profit = float(take_profit)
+                        pattern = decision.get("pattern", "unknown")
+                        reasoning = decision.get("reasoning", "")
 
                     # Confidence threshold
                     if confidence < BACKTEST_RISK["min_confidence_to_trade"]:
@@ -815,9 +971,9 @@ class BacktestEngine:
                         "qty": shares,
                         "stop_loss": stop_loss,
                         "take_profit": take_profit,
-                        "pattern": decision.get("pattern", "unknown"),
+                        "pattern": pattern,
                         "confidence": confidence,
-                        "reasoning": decision.get("reasoning", ""),
+                        "reasoning": reasoning,
                         "phase": phase,
                     }
 
@@ -844,9 +1000,22 @@ class BacktestEngine:
             bar_high = float(bar["High"])
             bar_close = float(bar["Close"])
 
-            # Update highest price
+            # Update highest/lowest price
             if bar_high > pos.highest_price:
                 pos.highest_price = bar_high
+            if bar_low < pos.lowest_price:
+                pos.lowest_price = bar_low
+
+            # Phase 3: Track MAE/MFE
+            if pos.entry_price > 0:
+                adverse = (pos.entry_price - bar_low) / pos.entry_price * 100
+                favorable = (bar_high - pos.entry_price) / pos.entry_price * 100
+                if adverse > pos.mae:
+                    pos.mae = adverse
+                    pos.mae_time = current_time
+                if favorable > pos.mfe:
+                    pos.mfe = favorable
+                    pos.mfe_time = current_time
 
             # Check stop loss — require CLOSE below stop (not just wick)
             # This filters out noise wicks that briefly touch stop then reverse
@@ -855,15 +1024,29 @@ class BacktestEngine:
                 self._close_position(sym, exit_price, current_time, "Stop loss hit")
                 continue
 
-            # Scale out at 1R — sell HALF for symmetric dollar capture
+            # Phase 6: Adaptive exit system based on MAE/MFE analysis
+            # Key insight: 45% of losers were profitable, only 2.7% reached 1R,
+            # 86% exited via 30-min time stop. Need earlier profit protection.
+            current_r = (bar_close - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+            hold_minutes = (current_time - pos.entry_time).total_seconds() / 60
+
+            # 1. Breakeven lock: once trade reaches +0.3R, lock stop at breakeven
+            #    This protects the 45% of losers that were profitable at some point.
+            if not pos.breakeven_locked and current_r >= 0.3:
+                pos.current_stop = max(pos.entry_price, pos.current_stop)
+                pos.breakeven_locked = True
+
+            # 2. Scale out at 0.5R — sell 1/3 (was 1R sell 1/2)
+            #    Data shows only 2.7% of trades reach 1R, but many reach 0.5R
             if (pos.scale_out_stage == 0
                     and bar_high >= pos.r_target_1
                     and pos.shares_remaining > 1):
-                sell_qty = max(1, int(pos.quantity / 2))  # Half position
+                sell_qty = max(1, int(pos.quantity / 3))  # 1/3 position
                 actual_sell = min(sell_qty, pos.shares_remaining - 1)
                 if actual_sell > 0:
                     exit_price = pos.r_target_1 - SLIPPAGE_PER_SHARE
-                    pnl = (exit_price - pos.entry_price) * actual_sell
+                    costs = CostModel.round_trip_cost(pos.entry_price, exit_price, actual_sell)
+                    pnl = (exit_price - pos.entry_price) * actual_sell - costs
                     slippage = SLIPPAGE_PER_SHARE * 2 * actual_sell
                     r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
 
@@ -872,8 +1055,9 @@ class BacktestEngine:
                         entry_price=pos.entry_price, exit_price=exit_price,
                         quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
                         entry_time=pos.entry_time, exit_time=current_time,
-                        exit_reason="Scale out 1R (1/2)",
+                        exit_reason="Scale out 0.5R (1/3)",
                         confidence=pos.confidence, slippage_cost=slippage,
+                        trading_costs=costs, mae=pos.mae, mfe=pos.mfe,
                     ))
                     self.equity += pnl
                     self.daily_pnl += pnl
@@ -881,27 +1065,54 @@ class BacktestEngine:
                     pos.realized_pnl += pnl
                     pos.scale_out_stage = 1
                     pos.current_stop = pos.entry_price  # Move to breakeven
+                    pos.breakeven_locked = True
 
-            # 30-minute time stop with winner exception
-            # If profitable (>0.5R up), switch to tight trailing stop instead of hard close.
-            # If flat or losing at 30 min, close immediately — thesis is dead.
-            hold_minutes = (current_time - pos.entry_time).total_seconds() / 60
-            if hold_minutes >= 30:
-                current_r = (bar_close - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
-                if current_r > 0.5:
-                    # Winner exception: set tight trailing stop at 0.3R below current price
-                    tight_trail = bar_close - (0.3 * pos.risk_per_share)
-                    pos.current_stop = max(tight_trail, pos.entry_price)  # Floor at breakeven
-                    # Don't close — let the trailing stop manage the exit
-                else:
-                    exit_price = bar_close - SLIPPAGE_PER_SHARE
-                    self._close_position(sym, exit_price, current_time, "Time stop (30min)")
-                    continue
+            # 3. Scale out at 1.5R — sell another 1/3 (remainder trails)
+            if (pos.scale_out_stage == 1
+                    and bar_high >= pos.r_target_2
+                    and pos.shares_remaining > 1):
+                sell_qty = max(1, int(pos.quantity / 3))
+                actual_sell = min(sell_qty, pos.shares_remaining - 1)
+                if actual_sell > 0:
+                    exit_price = pos.r_target_2 - SLIPPAGE_PER_SHARE
+                    costs = CostModel.round_trip_cost(pos.entry_price, exit_price, actual_sell)
+                    pnl = (exit_price - pos.entry_price) * actual_sell - costs
+                    slippage = SLIPPAGE_PER_SHARE * 2 * actual_sell
+                    r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
 
-            # Trailing stop after 1R scale-out: trail at 1R from high, floor at breakeven
-            if pos.scale_out_stage >= 1:
-                r_trail = pos.highest_price - pos.risk_per_share
-                trail_stop = max(r_trail, pos.entry_price)
+                    self.completed_trades.append(BacktestTrade(
+                        symbol=sym, pattern=pos.pattern,
+                        entry_price=pos.entry_price, exit_price=exit_price,
+                        quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
+                        entry_time=pos.entry_time, exit_time=current_time,
+                        exit_reason="Scale out 1.5R (1/3)",
+                        confidence=pos.confidence, slippage_cost=slippage,
+                        trading_costs=costs, mae=pos.mae, mfe=pos.mfe,
+                    ))
+                    self.equity += pnl
+                    self.daily_pnl += pnl
+                    pos.shares_remaining -= actual_sell
+                    pos.realized_pnl += pnl
+                    pos.scale_out_stage = 2
+
+            # 4. Graduated time management (was hard 30-min close)
+            #    - 20 min: if profitable, trail tight; if losing, close
+            #    - 45 min: hard close regardless (was 30 min)
+            if hold_minutes >= 45:
+                exit_price = bar_close - SLIPPAGE_PER_SHARE
+                self._close_position(sym, exit_price, current_time, "Time stop (45min)")
+                continue
+            elif hold_minutes >= 20 and current_r <= 0:
+                # Losing after 20 min — thesis is dead, cut early
+                exit_price = bar_close - SLIPPAGE_PER_SHARE
+                self._close_position(sym, exit_price, current_time, "Time stop (20min loser)")
+                continue
+
+            # 5. Trailing stop: trail at 0.5R from high once profitable, floor at breakeven
+            if pos.breakeven_locked:
+                trail_distance = 0.5 * pos.risk_per_share
+                trail_stop = pos.highest_price - trail_distance
+                trail_stop = max(trail_stop, pos.entry_price)  # Floor at breakeven
                 if trail_stop > pos.current_stop:
                     pos.current_stop = trail_stop
 
@@ -933,8 +1144,10 @@ class BacktestEngine:
             del self.positions[symbol]
             return
 
-        pnl = (exit_price - pos.entry_price) * qty
-        slippage = SLIPPAGE_PER_SHARE * 2 * qty
+        # Phase 2: Realistic cost modeling
+        costs = CostModel.round_trip_cost(pos.entry_price, exit_price, qty)
+        pnl = (exit_price - pos.entry_price) * qty - costs
+        slippage = SLIPPAGE_PER_SHARE * 2 * qty  # Legacy tracking
         r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
 
         self.completed_trades.append(BacktestTrade(
@@ -944,6 +1157,8 @@ class BacktestEngine:
             entry_time=pos.entry_time, exit_time=exit_time,
             exit_reason=reason,
             confidence=pos.confidence, slippage_cost=slippage,
+            trading_costs=costs,
+            mae=pos.mae, mfe=pos.mfe,
         ))
         self.equity += pnl
         self.daily_pnl += pnl
@@ -959,6 +1174,14 @@ class BacktestEngine:
         # Track drawdown
         if self.equity > self.peak_equity:
             self.peak_equity = self.equity
+
+        # Pattern-level performance tracking (keep last 15 trades per pattern)
+        pat = pos.pattern or "unknown"
+        if pat not in self.pattern_performance:
+            self.pattern_performance[pat] = []
+        self.pattern_performance[pat].append(pnl)
+        if len(self.pattern_performance[pat]) > 15:
+            self.pattern_performance[pat] = self.pattern_performance[pat][-15:]
 
         del self.positions[symbol]
 
@@ -1258,7 +1481,8 @@ JSON only:
     def _get_regime(self, day_dt: datetime, spy_daily: pd.DataFrame, vix_daily: pd.DataFrame) -> dict:
         """Determine market regime for a given day (no look-ahead)."""
         regime = {"spy_trend": "unknown", "vix_level": "elevated", "regime": "bear_quiet",
-                  "spy_price": 0, "spy_sma_50": 0, "vix_price": 18}
+                  "spy_price": 0, "spy_sma_50": 0, "vix_price": 18,
+                  "spy_chop": 50.0, "spy_adx": 25.0}
 
         if spy_daily is not None and not spy_daily.empty:
             spy_to_date = spy_daily[spy_daily.index < _tz_aware_timestamp(day_dt, spy_daily.index)]
@@ -1268,6 +1492,15 @@ JSON only:
                 regime["spy_price"] = spy_price
                 regime["spy_sma_50"] = spy_sma_50
                 regime["spy_trend"] = "bullish" if spy_price >= spy_sma_50 else "bearish"
+
+                # Choppiness Index and ADX for market quality filtering
+                from autotrader.data.indicators import calculate_choppiness_index, calculate_adx
+                chop = calculate_choppiness_index(spy_to_date, period=14)
+                adx = calculate_adx(spy_to_date, period=14)
+                if chop is not None:
+                    regime["spy_chop"] = chop
+                if adx is not None:
+                    regime["spy_adx"] = adx
 
         if vix_daily is not None and not vix_daily.empty:
             vix_to_date = vix_daily[vix_daily.index < _tz_aware_timestamp(day_dt, vix_daily.index)]
@@ -1583,12 +1816,20 @@ JSON only:
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return [sym for sym, _ in ranked[:15]]
 
+    _CORRELATED_GROUPS = {
+        "mega_tech": {"AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN"},
+        "semis": {"NVDA", "AMD", "INTC", "AVGO", "QCOM", "MU", "TSM", "ASML"},
+        "ev_auto": {"TSLA", "RIVN", "LCID", "NIO", "GM", "F"},
+        "banking": {"JPM", "BAC", "GS", "MS", "WFC", "C"},
+        "energy": {"XOM", "CVX", "COP", "SLB", "OXY", "EOG"},
+        "biotech": {"MRNA", "PFE", "JNJ", "ABBV", "LLY", "BMY"},
+    }
+    _MAX_SECTOR_CONCENTRATION = 2
+
     def _check_sector_ok(self, symbol: str) -> bool:
         """Check sector concentration against current positions."""
-        from autotrader.risk.manager import CORRELATED_GROUPS, MAX_SECTOR_CONCENTRATION
-
         target_group = None
-        for group, members in CORRELATED_GROUPS.items():
+        for group, members in self._CORRELATED_GROUPS.items():
             if symbol in members:
                 target_group = group
                 break
@@ -1596,8 +1837,8 @@ JSON only:
         if target_group is None:
             return True
 
-        held = [s for s in self.positions if s in CORRELATED_GROUPS.get(target_group, [])]
-        return len(held) < MAX_SECTOR_CONCENTRATION
+        held = [s for s in self.positions if s in self._CORRELATED_GROUPS.get(target_group, set())]
+        return len(held) < self._MAX_SECTOR_CONCENTRATION
 
     def _build_result(self, trading_days: int) -> BacktestResult:
         """Build the final result object."""
@@ -1611,6 +1852,7 @@ JSON only:
             total_pnl=sum(t.pnl for t in self.completed_trades),
             total_r=sum(t.r_multiple for t in self.completed_trades),
             total_slippage=sum(t.slippage_cost for t in self.completed_trades),
+            total_costs=sum(t.trading_costs for t in self.completed_trades),
             starting_equity=self.starting_equity,
             ending_equity=self.equity,
             trades=self.completed_trades,
@@ -1662,9 +1904,21 @@ def format_backtest_result(result: BacktestResult) -> str:
         f"  Total R:         {result.total_r:+.1f}",
         f"  Avg R/Trade:     {result.avg_r:+.2f}",
         f"  Total Slippage:  ${result.total_slippage:,.2f}",
+        f"  Trading Costs:   ${result.total_costs:,.2f}",
         f"  Equity:          ${result.starting_equity:,.0f} → ${result.ending_equity:,.0f}",
         f"  API Calls:       {result.api_calls} | Cache Hits: {result.cache_hits}",
     ]
+
+    # Phase 2: Cost drag analysis
+    if result.total_costs > 0:
+        gross_pnl = result.total_pnl + result.total_costs
+        cost_drag = (result.total_costs / abs(gross_pnl) * 100) if gross_pnl != 0 else 0
+        lines.append("")
+        lines.append("─── COST ANALYSIS ───")
+        lines.append(f"  Gross P&L:       ${gross_pnl:,.2f}")
+        lines.append(f"  Total Costs:     ${result.total_costs:,.2f}")
+        lines.append(f"  Net P&L:         ${result.total_pnl:,.2f}")
+        lines.append(f"  Cost drag:       {cost_drag:.1f}% of gross P&L")
 
     # PASS/FAIL thresholds
     lines.append("")
@@ -1708,18 +1962,26 @@ def format_backtest_result(result: BacktestResult) -> str:
             )
 
     # Phase breakdown
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    et_tz = ZoneInfo("US/Eastern")
+
     phase_perf: dict[str, dict] = {}
     for t in result.trades:
         p = t.market_phase or "unknown"
         if not p or p == "unknown":
-            # Infer phase from exit time
+            # Infer phase from entry time (convert UTC → ET)
             if hasattr(t.entry_time, 'hour'):
-                h = t.entry_time.hour
+                entry_et = t.entry_time.astimezone(et_tz) if t.entry_time.tzinfo else t.entry_time
+                h = entry_et.hour
+                m = entry_et.minute
                 if h < 10:
                     p = "open"
                 elif h < 11:
                     p = "prime"
-                elif h < 14:
+                elif h == 11 or (h < 13) or (h == 13 and m < 30):
                     p = "lunch"
                 elif h < 15:
                     p = "afternoon"
@@ -1747,6 +2009,68 @@ def format_backtest_result(result: BacktestResult) -> str:
                 f"  {p:15s} {s['trades']:3d} trades | WR: {wr:5.1f}% | "
                 f"Avg R: {avg_r:+.2f} | P&L: ${s['pnl']:>9,.2f}"
             )
+
+    # Phase 3: MAE/MFE Analysis
+    if result.trades:
+        winners = [t for t in result.trades if t.pnl > 0]
+        losers = [t for t in result.trades if t.pnl <= 0]
+
+        lines.append("")
+        lines.append("─── MAE/MFE ANALYSIS ───")
+
+        if winners:
+            avg_winner_mae = np.mean([t.mae for t in winners])
+            avg_winner_mfe = np.mean([t.mfe for t in winners])
+            avg_winner_return = np.mean([(t.exit_price - t.entry_price) / t.entry_price * 100 for t in winners if t.entry_price > 0])
+            lines.append(f"  Winners avg MAE: {avg_winner_mae:.2f}% (noise before profit)")
+            lines.append(f"  Winners avg MFE: {avg_winner_mfe:.2f}% (max potential)")
+            lines.append(f"  Winners left on table: {avg_winner_mfe - avg_winner_return:.2f}%")
+
+        if losers:
+            avg_loser_mae = np.mean([t.mae for t in losers])
+            avg_loser_mfe = np.mean([t.mfe for t in losers])
+            lines.append(f"  Losers avg MAE:  {avg_loser_mae:.2f}% (how far against)")
+            lines.append(f"  Losers avg MFE:  {avg_loser_mfe:.2f}% (were they ever profitable?)")
+
+            losers_were_profitable = sum(1 for t in losers if t.mfe > 0.3)
+            pct_losers_profitable = losers_were_profitable / len(losers) * 100 if losers else 0
+            lines.append(f"  Losers that had >0.3% MFE: {pct_losers_profitable:.0f}%")
+
+    # Phase 5: Monthly Breakdown
+    if result.trades:
+        monthly: dict[str, dict] = {}
+        for t in result.trades:
+            if hasattr(t.entry_time, 'strftime'):
+                month_key = t.entry_time.strftime("%Y-%m")
+            else:
+                month_key = str(t.entry_time)[:7]
+            if month_key not in monthly:
+                monthly[month_key] = {"trades": 0, "wins": 0, "pnl": 0.0}
+            monthly[month_key]["trades"] += 1
+            monthly[month_key]["pnl"] += t.pnl
+            if t.pnl > 0:
+                monthly[month_key]["wins"] += 1
+
+        if monthly:
+            lines.append("")
+            lines.append("─── MONTHLY BREAKDOWN ───")
+            for month, stats in sorted(monthly.items()):
+                wr = stats["wins"] / stats["trades"] * 100 if stats["trades"] > 0 else 0
+                ret_pct = stats["pnl"] / result.starting_equity * 100
+                lines.append(
+                    f"  {month}: {stats['trades']:3d} trades | WR: {wr:5.1f}% | "
+                    f"P&L: ${stats['pnl']:>9,.2f} | Return: {ret_pct:+.2f}%"
+                )
+
+    # Phase 7: Survivorship Bias Adjustment
+    if result.trades and result.trading_days > 0:
+        avg_monthly_return = result.return_pct / max(1, result.trading_days / 21)
+        adjusted_monthly = avg_monthly_return * 0.85  # 15% haircut
+        lines.append("")
+        lines.append("─── SURVIVORSHIP BIAS ADJUSTMENT ───")
+        lines.append(f"  Raw avg monthly return:      {avg_monthly_return:+.2f}%")
+        lines.append(f"  Adjusted (-15% bias):        {adjusted_monthly:+.2f}%")
+        lines.append(f"  Note: Survivorship bias inflates returns 10-20% for US equities")
 
     lines.append("")
     lines.append("═══════════════════════════════════════════════════════════")

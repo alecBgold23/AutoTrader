@@ -176,8 +176,98 @@ def fetch_daily_bars(symbol: str, start_date: str, end_date: str) -> pd.DataFram
         return pd.DataFrame()
 
 
+def fetch_daily_bars_batch(symbols: list[str], start_date: str, end_date: str) -> dict[str, pd.DataFrame]:
+    """Batch-fetch daily bars for many symbols using yf.download().
+
+    Much more rate-limit friendly than individual Ticker.history() calls.
+    Checks cache first, only downloads uncached symbols.
+    """
+    import yfinance as yf
+
+    result = {}
+    uncached = []
+
+    # Check cache first
+    for sym in symbols:
+        cache_file = CACHE_DIR / f"{sym}_{start_date.replace('-', '')}_{end_date.replace('-', '')}_1d.csv"
+        if cache_file.exists():
+            try:
+                df = _read_cached_csv(cache_file)
+                if not df.empty:
+                    result[sym] = df
+                    continue
+            except Exception:
+                pass
+        uncached.append(sym)
+
+    if not uncached:
+        return result
+
+    logger.info(f"Batch downloading daily bars for {len(uncached)} uncached symbols...")
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=250)
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=5)
+
+    # Download in chunks of 100 to avoid timeouts
+    chunk_size = 100
+    for i in range(0, len(uncached), chunk_size):
+        chunk = uncached[i:i + chunk_size]
+        try:
+            data = yf.download(
+                chunk,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
+            if data.empty:
+                continue
+
+            for sym in chunk:
+                try:
+                    if len(chunk) == 1:
+                        df = data[["Open", "High", "Low", "Close", "Volume"]].copy()
+                    else:
+                        df = data[sym][["Open", "High", "Low", "Close", "Volume"]].copy()
+                    df = df.dropna(how="all")
+                    if df.empty:
+                        continue
+                    # Cache it
+                    cache_file = CACHE_DIR / f"{sym}_{start_date.replace('-', '')}_{end_date.replace('-', '')}_1d.csv"
+                    try:
+                        df.to_csv(cache_file)
+                    except Exception:
+                        pass
+                    result[sym] = df
+                except Exception:
+                    pass
+
+            logger.info(f"  Batch {i // chunk_size + 1}: downloaded {len(chunk)} symbols")
+        except Exception as e:
+            logger.warning(f"Batch download failed for chunk {i}: {e}")
+
+    return result
+
+
 def get_trading_days(start_date: str, end_date: str) -> list[datetime]:
     """Get list of trading days in range using SPY data as reference."""
+    # Try cached SPY daily first to avoid yfinance rate limits
+    spy_df = fetch_spy_daily(start_date, end_date)
+    if not spy_df.empty:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        days = []
+        for d in spy_df.index:
+            dt = d.to_pydatetime() if hasattr(d, 'to_pydatetime') else d
+            # Strip timezone for comparison
+            dt_naive = dt.replace(tzinfo=None) if hasattr(dt, 'replace') and dt.tzinfo else dt
+            if start_dt <= dt_naive <= end_dt:
+                days.append(dt)
+        if days:
+            return days
+
     import yfinance as yf
     spy = yf.Ticker("SPY")
     hist = spy.history(start=start_date, end=end_date, interval="1d")
