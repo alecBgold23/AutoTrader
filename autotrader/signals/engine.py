@@ -64,8 +64,10 @@ class SignalEngine:
     MIN_CONFLUENCE = 3       # Minimum bullish factors (out of 5)
 
     # Price tier — cheap stocks have terrible cost efficiency
-    MIN_PRICE = 30           # Skip stocks under $30 (34.7% WR, $43 avg cost)
+    MIN_PRICE = 30           # Hard floor: skip penny stocks (34.7% WR, $43 avg cost)
     MAX_PRICE = 500          # Skip stocks over $500 (small sample, wide spreads)
+    # Note: $30-60 range is penalized via confidence model price_component,
+    # not hard-blocked. This lets exceptional setups still pass.
 
     # Stop loss methodology
     STOP_ATR_MULTIPLIER = 1.5  # Stop = entry - (ATR * multiplier)
@@ -268,15 +270,17 @@ class SignalEngine:
             confluence_component = 0.0
 
         # 3. Price tier component (0-1, 0.20 weight)
-        # Backtested: $50-100 = 57.5% WR, $100-200 = 48.9%, $20-50 = 35.6%
-        if 50 <= price <= 150:
+        # Backtested: $60-150 = 57.5% WR, $150-300 = decent, $30-60 = 30.6% WR
+        if 60 <= price <= 150:
             price_component = 1.0   # Sweet spot
         elif 150 < price <= 300:
             price_component = 0.7   # Still good
-        elif 30 <= price < 50:
-            price_component = 0.4   # Marginal
+        elif 300 < price <= 500:
+            price_component = 0.5   # Less liquid
+        elif 30 <= price < 60:
+            price_component = 0.25  # $30-60 penalized (30.6% WR, -$6,430)
         else:
-            price_component = 0.2   # Edge cases
+            price_component = 0.1   # Sub-$30 or edge cases
 
         # 4. Phase component (0-1, 0.15 weight)
         # Prime: 50-60% WR, Open: mixed, Afternoon: BLOCKED (won't reach here)
@@ -451,13 +455,10 @@ class SignalEngine:
             else:
                 score += 10  # Extended breakout, lower conviction
 
-        # ── Gap & Go ──
-        if abs(gap_pct) >= 3.0:
-            rvol = float(ind.get("relative_volume") or 0)
-            if rvol >= 2.0 and gap_pct > 0:
-                score += 30
-                if setup == SetupType.NO_SETUP:
-                    setup = SetupType.GAP_AND_GO
+        # ── Gap & Go ── BLOCKED
+        # Data: -$5,889 across 607 trades, 34.9% WR. Volatile names (GME, GTLB,
+        # NVDL) dominate losses. Gap continuation is unreliable intraday.
+        # Do NOT assign score or setup for gap-and-go.
 
         # ── VWAP Reclaim ──
         vwap = ind.get("vwap") or intra.get("vwap_5m")

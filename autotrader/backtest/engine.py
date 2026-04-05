@@ -43,22 +43,24 @@ def _tz_aware_timestamp(dt, index):
 
 # Analysis times ordered for best full-day coverage when sliced to [:N].
 # First 10 cover every phase of the day; extras fill prime-time gaps.
+# Phase blocking is handled by the signal engine (blocks lunch, afternoon,
+# close, premarket) and the backtest engine (blocks late-day entries).
 DEFAULT_ANALYSIS_TIMES = [
     time(9, 35),   # Open (ORB forming)
     time(10, 0),   # Prime start (10 AM reversal zone)
     time(10, 30),  # Prime mid
-    time(11, 0),   # Late morning
-    time(11, 45),  # Lunch
-    time(13, 0),   # Mid-day
-    time(14, 0),   # Afternoon
-    time(14, 45),  # Afternoon late
+    time(10, 50),  # Prime late
+    time(11, 0),   # Late morning (lunch blocked by signal engine)
+    time(11, 45),  # Lunch (blocked by signal engine)
+    time(13, 0),   # Mid-day (blocked by signal engine)
+    time(14, 0),   # Afternoon (blocked by signal engine)
+    time(14, 45),  # Afternoon late (blocked by signal engine)
     time(15, 15),  # Power hour
-    time(15, 35),  # Power hour late
     # Extra slots if cycles > 10
     time(9, 50),   # Late open
     time(10, 15),  # Prime extra
     time(10, 45),  # Prime extra
-    time(14, 30),  # Afternoon mid
+    time(14, 30),  # Afternoon mid (blocked)
 ]
 
 # Backtest-specific risk parameters (more aggressive than live for discovery)
