@@ -400,12 +400,12 @@ Claude sees "{trades_today}/8 trades used" and is taught to pace itself.
 
 ## Known Issues / Not Yet Configured
 
-- **Live ≠ Backtest parameters** — Backtest has tuned parameters (1/2 scale-outs, close-based stops, 15% risk, lunch blocking, flattened regime) that haven't been ported to live code yet. Live still uses conservative 1% risk, 1/3 scale-outs, wick-based stops. Pending sync after validation.
+- **Live ≈ Backtest parameters** — Live now uses same risk params (15% per trade, 20% max position, 80% exposure), same signal engines (long + short), same position management (1/3 scale-outs at 0.5R and 1.5R, 0.4R breakeven lock, trailing stops). Minor differences: live uses broker-side stops (GTC) for crash protection; backtest uses simulated close-based stops.
 - **Anthropic API credits depleted** — The API key in `.env` has $0 balance. Backtests rely entirely on cached Claude responses. Any cache miss (new symbols, changed data) fails silently with 0 trades for that analysis cycle. Need to top up credits to test new periods or invalidate cache.
 - **Jan-Mar 2024 backtest broken** — 5m bar data was re-downloaded, changing price/volume values, which invalidated all Claude cache keys for that period. Requires fresh API credits to re-cache.
 - **launchd import error** — `alpaca.data.news.NewsClient` module not found on launchd restart. The Friday process (manual `run.py`) works fine. Need to fix the launchd plist Python/venv path.
 - **Telegram** not configured — alerts are silently skipped
-- **Shorting in backtest only** — `ShortSignalEngine` (`signals/short_engine.py`) integrated into `backtest/engine.py` with direction-aware P&L, stops, scale-outs. Patterns: Bear Flag (77% WR), ORB Breakdown (70% WR). Gap & Fade blocked. Live trading (`main.py`, `broker.py`) is still long-only — needs sync.
+- **Shorting enabled in both live and backtest** — `ShortSignalEngine` (`signals/short_engine.py`) integrated into both `backtest/engine.py` and `main.py` with direction-aware P&L, stops, scale-outs, trailing stops, and broker stop orders. Patterns: ORB Breakdown, VWAP Rejection, Bear Flag, LOD Break. Gap & Fade blocked. Controlled via `ENABLE_SHORT` in `config.py`.
 - **Scanner uses yfinance batch downloads** — Can be slow on initial universe build (~2-3 min for 800 stocks)
 - **Backtest results not reproducible across sessions** — yfinance adjusts historical prices over time. Daily data cached on different dates produces different scanner scores and symbol selection.
 

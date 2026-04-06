@@ -54,6 +54,8 @@ WATCHLIST_FALLBACK = [
 DAY_TRADE_MODE = True                   # Enable day trading behavior
 CLOSE_ALL_EOD = True                    # Close all positions before market close
 EOD_CLOSE_MINUTE = 50                   # Close positions at 3:50 PM ET
+ENABLE_LONG = True                      # Enable long (buy) signals
+ENABLE_SHORT = True                     # Enable short (sell) signals
 
 # Scan intervals (in minutes)
 SCAN_INTERVAL_OPEN = 2                  # First 30 min after open (high volatility)

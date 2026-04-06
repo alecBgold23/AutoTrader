@@ -120,6 +120,38 @@ class AlpacaBroker:
             logger.error(f"Failed to sell {quantity} shares of {symbol}: {e}")
             return False
 
+    def short_shares(self, symbol: str, quantity: int) -> str | None:
+        """Place a market short order. Returns order_id or None."""
+        try:
+            order = self._place_market_order(symbol, quantity, OrderSide.SELL)
+            if order:
+                logger.info(f"SHORT MARKET: {quantity} {symbol} (order_id={order.id})")
+                return str(order.id)
+            return None
+        except APIError as e:
+            logger.error(f"Failed to short {quantity} {symbol}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error shorting {symbol}: {e}")
+            return None
+
+    def buy_to_cover(self, symbol: str, quantity: int) -> bool:
+        """Buy shares to cover a short position (partial or full)."""
+        try:
+            self.cancel_orders_for_symbol(symbol)
+            request = MarketOrderRequest(
+                symbol=symbol,
+                qty=quantity,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+            )
+            order = self.client.submit_order(request)
+            logger.info(f"BUY TO COVER: {quantity} shares of {symbol} (order_id={order.id})")
+            return True
+        except APIError as e:
+            logger.error(f"Failed to cover {quantity} shares of {symbol}: {e}")
+            return False
+
     def close_position(self, symbol: str) -> bool:
         """Close an entire position. Cancels pending orders first to free held shares."""
         try:
@@ -230,31 +262,36 @@ class AlpacaBroker:
             logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
 
-    def place_stop_loss(self, symbol: str, qty: int, stop_price: float) -> str | None:
-        """Place a broker-side stop loss order. Returns order ID or None."""
+    def place_stop_loss(self, symbol: str, qty: int, stop_price: float, side: str = "LONG") -> str | None:
+        """Place a broker-side stop loss order. Returns order ID or None.
+
+        For longs: SELL stop (triggers when price drops to stop).
+        For shorts: BUY stop (triggers when price rises to stop).
+        """
         try:
+            order_side = OrderSide.BUY if side == "SHORT" else OrderSide.SELL
             request = StopOrderRequest(
                 symbol=symbol,
                 qty=qty,
-                side=OrderSide.SELL,
+                side=order_side,
                 time_in_force=TimeInForce.GTC,
                 stop_price=round(stop_price, 2),
             )
             order = self.client.submit_order(request)
             logger.info(
                 f"BROKER STOP placed: {symbol} {qty} shares @ ${stop_price:.2f} "
-                f"(order_id={order.id})"
+                f"({side} → {order_side.value}) (order_id={order.id})"
             )
             return str(order.id)
         except Exception as e:
             logger.error(f"Failed to place stop loss for {symbol}: {e}")
             return None
 
-    def replace_stop_loss(self, old_order_id: str, symbol: str, qty: int, new_stop: float) -> str | None:
+    def replace_stop_loss(self, old_order_id: str, symbol: str, qty: int, new_stop: float, side: str = "LONG") -> str | None:
         """Cancel old stop and place a new one at a different price/quantity."""
         if old_order_id:
             self.cancel_order(old_order_id)
-        return self.place_stop_loss(symbol, qty, new_stop)
+        return self.place_stop_loss(symbol, qty, new_stop, side=side)
 
     # ��─ Private methods ────────────────────────────────
 

@@ -20,8 +20,10 @@ from autotrader.config import (
     PHASE_CONFIG, RISK, LOG_DIR, LOG_LEVEL,
     DAY_TRADE_MODE, CLOSE_ALL_EOD, EOD_CLOSE_MINUTE,
     SCANNER, WATCHLIST_FALLBACK,
+    ENABLE_LONG, ENABLE_SHORT,
 )
 from autotrader.signals.engine import SignalEngine
+from autotrader.signals.short_engine import ShortSignalEngine
 from autotrader.execution.broker import AlpacaBroker
 from autotrader.data.scanner import MarketScanner
 from autotrader.data.market import get_current_price, get_stock_data, get_intraday_data
@@ -109,6 +111,7 @@ class LivePosition:
     stop_loss: float
     take_profit: float
     entry_time: datetime
+    direction: str = "long"       # "long" or "short"
     pattern: str = ""
     confidence: float = 0.0
     risk_per_share: float = 0.0
@@ -128,8 +131,12 @@ class LivePosition:
         self.highest_price = self.entry_price
         self.lowest_price = self.entry_price
         self.shares_remaining = self.quantity
-        self.r_target_1 = self.entry_price + self.risk_per_share * 0.5   # 0.5R first target
-        self.r_target_2 = self.entry_price + self.risk_per_share * 1.5   # 1.5R second target
+        if self.direction == "short":
+            self.r_target_1 = self.entry_price - self.risk_per_share * 0.5   # 0.5R below for shorts
+            self.r_target_2 = self.entry_price - self.risk_per_share * 1.5   # 1.5R below for shorts
+        else:
+            self.r_target_1 = self.entry_price + self.risk_per_share * 0.5   # 0.5R first target
+            self.r_target_2 = self.entry_price + self.risk_per_share * 1.5   # 1.5R second target
         self.current_stop = self.stop_loss
 
 
@@ -142,6 +149,7 @@ class AutoTrader:
 
     def __init__(self):
         self.signal_engine = SignalEngine()
+        self.short_signal_engine = ShortSignalEngine()
         self.broker = AlpacaBroker()
         self.scanner = MarketScanner()
         self.telegram = TelegramAlerts()
@@ -460,8 +468,9 @@ class AutoTrader:
             vwap=vwap,
         )
 
-        # ── Call SignalEngine — IDENTICAL to backtest ──
-        decision = self.signal_engine.score(
+        # ── Call both signal engines — mirrors backtest ──
+        regime_str = self.regime.state.regime if self.regime.state else "unknown"
+        score_kwargs = dict(
             symbol=symbol,
             price_data=price_data,
             indicators=indicators,
@@ -469,10 +478,40 @@ class AutoTrader:
             patterns_text=patterns_text,
             levels=key_levels,
             phase=phase,
-            regime=self.regime.state.regime if self.regime.state else "unknown",
+            regime=regime_str,
         )
 
-        if decision.action != "BUY":
+        decision = None
+        direction = "long"
+
+        if ENABLE_LONG:
+            long_decision = self.signal_engine.score(**score_kwargs)
+        else:
+            long_decision = None
+
+        if ENABLE_SHORT:
+            short_decision = self.short_signal_engine.score(**score_kwargs)
+        else:
+            short_decision = None
+
+        # Pick the best signal — higher confidence wins
+        long_ok = long_decision and long_decision.action == "BUY"
+        short_ok = short_decision and short_decision.action == "SHORT"
+
+        if long_ok and short_ok:
+            if long_decision.confidence >= short_decision.confidence:
+                decision = long_decision
+                direction = "long"
+            else:
+                decision = short_decision
+                direction = "short"
+        elif long_ok:
+            decision = long_decision
+            direction = "long"
+        elif short_ok:
+            decision = short_decision
+            direction = "short"
+        else:
             return
 
         confidence = decision.confidence
@@ -497,6 +536,10 @@ class AutoTrader:
         else:
             phase_mult = max(phase_mult, 0.40)
 
+        # Pattern-quality sizing: ORB patterns get full size, others get 50%
+        pattern = decision.pattern if hasattr(decision, 'pattern') else ""
+        pattern_mult = 1.0 if pattern and "ORB" in pattern else 0.50
+
         risk_amount = (
             equity
             * LIVE_RISK["max_risk_per_trade_pct"]
@@ -520,17 +563,25 @@ class AutoTrader:
         if shares <= 0:
             return
 
-        # ── EXECUTE ──
+        # Apply pattern sizing AFTER caps — identical to backtest
+        shares = max(1, int(shares * pattern_mult))
+
+        # ── EXECUTE — direction-aware ──
+        action_label = "SHORT" if direction == "short" else "BUY"
         logger.info(
-            f"BUY SIGNAL: {symbol} | {decision.pattern} | "
+            f"{action_label} SIGNAL: {symbol} | {decision.pattern} | "
             f"conf={confidence:.2f} | score={decision.score:.0f} | "
             f"${price:.2f} | SL=${stop_loss:.2f} | TP=${take_profit:.2f} | "
             f"{shares} shares | {decision.reasoning}"
         )
 
-        order_id = self.broker.buy_shares(symbol, shares)
+        if direction == "short":
+            order_id = self.broker.short_shares(symbol, shares)
+        else:
+            order_id = self.broker.buy_shares(symbol, shares)
+
         if not order_id:
-            logger.error(f"Failed to execute buy for {symbol}")
+            logger.error(f"Failed to execute {action_label.lower()} for {symbol}")
             return
 
         # Register position — mirrors SimulatedPosition from backtest
@@ -542,19 +593,23 @@ class AutoTrader:
             stop_loss=stop_loss,
             take_profit=take_profit,
             entry_time=now,
+            direction=direction,
             pattern=decision.pattern,
             confidence=confidence,
         )
 
-        # Place broker-side stop loss for crash protection
-        stop_id = self.broker.place_stop_loss(symbol, shares, stop_loss)
+        # Place broker-side stop loss for crash protection (direction-aware)
+        stop_id = self.broker.place_stop_loss(
+            symbol, shares, stop_loss,
+            side="SHORT" if direction == "short" else "LONG",
+        )
         if stop_id:
             self.positions[symbol].broker_stop_order_id = stop_id
 
         self.daily_trades += 1
 
         await self.telegram.send_message(
-            f"*BUY*: {symbol} | {shares} shares @ ${price:.2f}\n"
+            f"*{action_label}*: {symbol} | {shares} shares @ ${price:.2f}\n"
             f"Pattern: {decision.pattern} | Conf: {confidence:.2f}\n"
             f"Stop: ${stop_loss:.2f} | Target: ${take_profit:.2f}\n"
             f"{decision.reasoning}"
@@ -585,48 +640,70 @@ class AutoTrader:
                     continue
                 current_price = price_data["price"]
 
+                is_short = pos.direction == "short"
+                side_label = "SHORT" if is_short else "LONG"
+
                 # Update highest/lowest — identical to backtest
                 if current_price > pos.highest_price:
                     pos.highest_price = current_price
                 if current_price < pos.lowest_price:
                     pos.lowest_price = current_price
 
-                # Check stop loss — identical to backtest (close-based)
-                if current_price <= pos.current_stop:
-                    logger.info(f"STOP HIT: {sym} @ ${current_price:.2f} (stop=${pos.current_stop:.2f})")
+                # Check stop loss — direction-aware (identical to backtest)
+                if is_short:
+                    stop_hit = current_price >= pos.current_stop
+                else:
+                    stop_hit = current_price <= pos.current_stop
+
+                if stop_hit:
+                    logger.info(f"STOP HIT: {sym} ({side_label}) @ ${current_price:.2f} (stop=${pos.current_stop:.2f})")
                     await self._close_live_position(sym, "Stop loss hit")
                     continue
 
-                # Calculate current R and hold time — identical to backtest
-                current_r = (current_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+                # Calculate current R — direction-aware (identical to backtest)
+                if is_short:
+                    current_r = (pos.entry_price - current_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+                else:
+                    current_r = (current_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
                 hold_minutes = (now - pos.entry_time).total_seconds() / 60
 
-                # 1. Breakeven lock at +0.3R — identical to backtest
-                if not pos.breakeven_locked and current_r >= 0.3:
-                    new_stop = max(pos.entry_price, pos.current_stop)
-                    if new_stop > pos.current_stop:
+                # 1. Breakeven lock at +0.4R — identical to backtest
+                if not pos.breakeven_locked and current_r >= 0.4:
+                    if is_short:
+                        new_stop = min(pos.entry_price, pos.current_stop)
+                        improved = new_stop < pos.current_stop
+                    else:
+                        new_stop = max(pos.entry_price, pos.current_stop)
+                        improved = new_stop > pos.current_stop
+
+                    if improved:
                         pos.current_stop = new_stop
                         pos.breakeven_locked = True
-                        # Update broker stop
                         if pos.broker_stop_order_id:
                             new_id = self.broker.replace_stop_loss(
                                 pos.broker_stop_order_id, sym,
                                 pos.shares_remaining, pos.current_stop,
+                                side="SHORT" if is_short else "LONG",
                             )
                             pos.broker_stop_order_id = new_id or ""
-                        logger.info(f"BREAKEVEN LOCK: {sym} stop → ${pos.current_stop:.2f}")
+                        logger.info(f"BREAKEVEN LOCK: {sym} ({side_label}) stop → ${pos.current_stop:.2f}")
 
-                # 2. Scale out at 0.5R — sell 1/3 — identical to backtest
+                # 2. Scale out at 0.5R — direction-aware
+                target_1_hit = (current_price <= pos.r_target_1) if is_short else (current_price >= pos.r_target_1)
                 if (pos.scale_out_stage == 0
-                        and current_price >= pos.r_target_1
+                        and target_1_hit
                         and pos.shares_remaining > 1):
                     sell_qty = max(1, int(pos.quantity / 3))
                     actual_sell = min(sell_qty, pos.shares_remaining - 1)
                     if actual_sell > 0:
-                        success = self.broker.sell_shares(sym, actual_sell)
+                        if is_short:
+                            success = self.broker.buy_to_cover(sym, actual_sell)
+                            pnl = (pos.entry_price - current_price) * actual_sell
+                        else:
+                            success = self.broker.sell_shares(sym, actual_sell)
+                            pnl = (current_price - pos.entry_price) * actual_sell
                         if success:
                             r_mult = current_r
-                            pnl = (current_price - pos.entry_price) * actual_sell
                             pos.shares_remaining -= actual_sell
                             pos.realized_pnl += pnl
                             pos.scale_out_stage = 1
@@ -634,33 +711,38 @@ class AutoTrader:
                             pos.breakeven_locked = True
                             self.daily_pnl += pnl
                             self._daily_r += r_mult * (actual_sell / pos.quantity)
-                            # Update broker stop for remaining shares
                             if pos.broker_stop_order_id:
                                 new_id = self.broker.replace_stop_loss(
                                     pos.broker_stop_order_id, sym,
                                     pos.shares_remaining, pos.current_stop,
+                                    side="SHORT" if is_short else "LONG",
                                 )
                                 pos.broker_stop_order_id = new_id or ""
                             logger.info(
-                                f"SCALE OUT 0.5R: {sym} sold {actual_sell} shares @ ${current_price:.2f} "
+                                f"SCALE OUT 0.5R: {sym} ({side_label}) {actual_sell} shares @ ${current_price:.2f} "
                                 f"(+${pnl:.2f})"
                             )
                             await self.telegram.send_message(
-                                f"*Scale Out 0.5R*: {sym} | {actual_sell} shares @ ${current_price:.2f}\n"
+                                f"*Scale Out 0.5R*: {sym} ({side_label}) | {actual_sell} shares @ ${current_price:.2f}\n"
                                 f"P&L: ${pnl:+.2f} | Remaining: {pos.shares_remaining}"
                             )
 
-                # 3. Scale out at 1.5R — sell another 1/3 — identical to backtest
+                # 3. Scale out at 1.5R — direction-aware
+                target_2_hit = (current_price <= pos.r_target_2) if is_short else (current_price >= pos.r_target_2)
                 if (pos.scale_out_stage == 1
-                        and current_price >= pos.r_target_2
+                        and target_2_hit
                         and pos.shares_remaining > 1):
                     sell_qty = max(1, int(pos.quantity / 3))
                     actual_sell = min(sell_qty, pos.shares_remaining - 1)
                     if actual_sell > 0:
-                        success = self.broker.sell_shares(sym, actual_sell)
+                        if is_short:
+                            success = self.broker.buy_to_cover(sym, actual_sell)
+                            pnl = (pos.entry_price - current_price) * actual_sell
+                        else:
+                            success = self.broker.sell_shares(sym, actual_sell)
+                            pnl = (current_price - pos.entry_price) * actual_sell
                         if success:
                             r_mult = current_r
-                            pnl = (current_price - pos.entry_price) * actual_sell
                             pos.shares_remaining -= actual_sell
                             pos.realized_pnl += pnl
                             pos.scale_out_stage = 2
@@ -670,40 +752,47 @@ class AutoTrader:
                                 new_id = self.broker.replace_stop_loss(
                                     pos.broker_stop_order_id, sym,
                                     pos.shares_remaining, pos.current_stop,
+                                    side="SHORT" if is_short else "LONG",
                                 )
                                 pos.broker_stop_order_id = new_id or ""
                             logger.info(
-                                f"SCALE OUT 1.5R: {sym} sold {actual_sell} shares @ ${current_price:.2f} "
+                                f"SCALE OUT 1.5R: {sym} ({side_label}) {actual_sell} shares @ ${current_price:.2f} "
                                 f"(+${pnl:.2f})"
                             )
                             await self.telegram.send_message(
-                                f"*Scale Out 1.5R*: {sym} | {actual_sell} shares @ ${current_price:.2f}\n"
+                                f"*Scale Out 1.5R*: {sym} ({side_label}) | {actual_sell} shares @ ${current_price:.2f}\n"
                                 f"P&L: ${pnl:+.2f} | Remaining: {pos.shares_remaining}"
                             )
 
                 # 4. Time management — identical to backtest
-                # 45-min hard close
                 if hold_minutes >= 45:
-                    logger.info(f"TIME STOP 45min: {sym}")
+                    logger.info(f"TIME STOP 45min: {sym} ({side_label})")
                     await self._close_live_position(sym, "Time stop (45min)")
                     continue
-                # 20-min loser cut
                 elif hold_minutes >= 20 and current_r <= 0:
-                    logger.info(f"TIME STOP 20min loser: {sym}")
+                    logger.info(f"TIME STOP 20min loser: {sym} ({side_label})")
                     await self._close_live_position(sym, "Time stop (20min loser)")
                     continue
 
-                # 5. Trailing stop — identical to backtest
+                # 5. Trailing stop — direction-aware (identical to backtest)
                 if pos.breakeven_locked:
                     trail_distance = 0.5 * pos.risk_per_share
-                    trail_stop = pos.highest_price - trail_distance
-                    trail_stop = max(trail_stop, pos.entry_price)
-                    if trail_stop > pos.current_stop:
+                    if is_short:
+                        trail_stop = pos.lowest_price + trail_distance
+                        trail_stop = min(trail_stop, pos.entry_price)
+                        improved = trail_stop < pos.current_stop
+                    else:
+                        trail_stop = pos.highest_price - trail_distance
+                        trail_stop = max(trail_stop, pos.entry_price)
+                        improved = trail_stop > pos.current_stop
+
+                    if improved:
                         pos.current_stop = trail_stop
                         if pos.broker_stop_order_id:
                             new_id = self.broker.replace_stop_loss(
                                 pos.broker_stop_order_id, sym,
                                 pos.shares_remaining, pos.current_stop,
+                                side="SHORT" if is_short else "LONG",
                             )
                             pos.broker_stop_order_id = new_id or ""
 
@@ -711,21 +800,28 @@ class AutoTrader:
                 logger.error(f"Position management error for {sym}: {e}")
 
     async def _close_live_position(self, symbol: str, reason: str):
-        """Close a position via broker and update tracking."""
+        """Close a position via broker and update tracking. Direction-aware."""
         if symbol not in self.positions:
             return
 
         pos = self.positions[symbol]
+        is_short = pos.direction == "short"
         price_data = get_current_price(symbol)
         current_price = price_data["price"] if price_data else pos.entry_price
 
+        # Alpaca close_position works for both long and short
         success = self.broker.close_position(symbol)
         if not success:
             logger.error(f"Failed to close {symbol}")
             return
 
-        pnl = (current_price - pos.entry_price) * pos.shares_remaining
-        r_mult = (current_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+        # Direction-aware P&L
+        if is_short:
+            pnl = (pos.entry_price - current_price) * pos.shares_remaining
+            r_mult = (pos.entry_price - current_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+        else:
+            pnl = (current_price - pos.entry_price) * pos.shares_remaining
+            r_mult = (current_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
         self.daily_pnl += pnl
         self._daily_r += r_mult
 
@@ -740,11 +836,12 @@ class AutoTrader:
         else:
             self.consecutive_losses = 0
 
+        side_label = "SHORT" if is_short else "LONG"
         del self.positions[symbol]
 
-        logger.info(f"CLOSED {symbol}: P&L ${pnl:+,.2f} | R: {r_mult:+.2f} | {reason}")
+        logger.info(f"CLOSED {symbol} ({side_label}): P&L ${pnl:+,.2f} | R: {r_mult:+.2f} | {reason}")
         await self.telegram.send_message(
-            f"*Position Closed*: {symbol}\n"
+            f"*Position Closed*: {symbol} ({side_label})\n"
             f"P&L: ${pnl:+,.2f} | R: {r_mult:+.2f}\n"
             f"Reason: {reason}"
         )
@@ -809,29 +906,40 @@ class AutoTrader:
         self._running = False
 
     async def _reconcile_positions(self):
-        """On startup, register any existing broker positions."""
+        """On startup, register any existing broker positions. Detects direction."""
         broker_positions = self.broker.get_positions()
         for bp in broker_positions:
             sym = bp["symbol"]
             if sym not in self.positions:
                 entry = bp["avg_entry_price"]
-                qty = int(bp["qty"])
-                # Create a position with conservative stop (3% below entry)
-                stop = entry * 0.97
+                qty = abs(int(bp["qty"]))
+                # Detect direction from Alpaca side field
+                direction = "short" if bp.get("side", "").lower() == "short" else "long"
+                # Conservative stop: 3% from entry in the losing direction
+                if direction == "short":
+                    stop = entry * 1.03
+                    target = entry * 0.95
+                else:
+                    stop = entry * 0.97
+                    target = entry * 1.05
                 self.positions[sym] = LivePosition(
                     symbol=sym,
                     entry_price=entry,
                     quantity=qty,
                     stop_loss=stop,
-                    take_profit=entry * 1.05,
+                    take_profit=target,
                     entry_time=datetime.now(timezone.utc),
+                    direction=direction,
                     pattern="reconciled",
                 )
-                # Place broker stop if none exists
-                stop_id = self.broker.place_stop_loss(sym, qty, stop)
+                # Place broker stop if none exists (direction-aware)
+                stop_id = self.broker.place_stop_loss(
+                    sym, qty, stop,
+                    side="SHORT" if direction == "short" else "LONG",
+                )
                 if stop_id:
                     self.positions[sym].broker_stop_order_id = stop_id
-                logger.info(f"Reconciled position: {sym} {qty} shares @ ${entry:.2f}")
+                logger.info(f"Reconciled {direction.upper()} position: {sym} {qty} shares @ ${entry:.2f}")
 
     # ══════════════════════════════════════════════════════
     # HELPERS — identical to backtest engine
