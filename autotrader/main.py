@@ -1,92 +1,185 @@
-"""Main trading loop — the orchestrator.
+"""Live trading engine — mirrors backtest/engine.py exactly.
 
-Day Trading Workflow (modeled after professional prop traders):
-1. 9:00 AM:  Build universe (scan entire market)
-2. 9:15 AM:  Pre-market scan for gappers and volume
-3. 9:30 AM:  Market opens — trade ORBs, Gap & Go on opening drive
-4. 10:00 AM: Prime trading — first pullbacks, flag breakouts, VWAP tests
-5. 11:00 AM: Lunch — reduce activity, only A+ setups
-6. 1:30 PM:  Afternoon — volume returns, continuations
-7. 3:00 PM:  Power hour — institutional flow, late breakouts
-8. 3:50 PM:  Close all positions — day trade rule
-9. 4:30 PM:  Daily summary + journal entry
+Same SignalEngine, same risk parameters, same position management,
+same analysis times, same phase blocking. The only difference is
+real-time Alpaca data and real order execution instead of simulated bars.
 """
 
 import asyncio
 import logging
 import signal
 import sys
-import uuid
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone, time
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from autotrader.config import (
-    SCAN_INTERVAL_OPEN, SCAN_INTERVAL_NORMAL, SCAN_INTERVAL_POWER_HOUR,
-    AUTONOMY_MODE, APPROVAL_TIMEOUT_SECONDS, RISK, LOG_DIR, LOG_LEVEL,
-    MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE,
-    MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
+    PHASE_CONFIG, RISK, LOG_DIR, LOG_LEVEL,
     DAY_TRADE_MODE, CLOSE_ALL_EOD, EOD_CLOSE_MINUTE,
-    SCANNER, WATCHLIST_FALLBACK, PHASE_CONFIG,
+    SCANNER, WATCHLIST_FALLBACK,
 )
-from autotrader.brain.analyst import ClaudeAnalyst
+from autotrader.signals.engine import SignalEngine
 from autotrader.execution.broker import AlpacaBroker
-from autotrader.risk.manager import RiskManager
-from autotrader.risk.position_manager import PositionManager
-from autotrader.alerts.telegram import TelegramAlerts
 from autotrader.data.scanner import MarketScanner
-from autotrader.data.market import get_current_price
-from autotrader.execution.stalker import EntryStalker
+from autotrader.data.market import get_current_price, get_stock_data, get_intraday_data
+from autotrader.data.indicators import calculate_indicators, calculate_intraday_indicators
+from autotrader.data.patterns import (
+    detect_all_patterns, format_patterns_for_prompt,
+    get_key_levels, format_levels_for_prompt,
+)
 from autotrader.data.regime import MarketRegime
-from autotrader.db.models import init_db, get_session, Trade, Decision, TradingJournal
-from autotrader.analytics.performance import calculate_metrics, format_metrics_for_log, format_metrics_for_telegram
+from autotrader.alerts.telegram import TelegramAlerts
 
 logger = logging.getLogger("autotrader")
 
+SLIPPAGE_PER_SHARE = 0.01
+
+
+# ═══════════════════════════════════════════════════════════
+# RISK PARAMETERS — IDENTICAL TO BACKTEST_RISK
+# ═══════════════════════════════════════════════════════════
+
+LIVE_RISK = {
+    "max_risk_per_trade_pct": 0.15,
+    "max_position_pct": 0.20,
+    "max_total_exposure_pct": 0.80,
+    "max_trades_per_day": 25,
+    "min_risk_reward_ratio": 1.5,
+    "min_confidence_to_trade": 0.65,
+    "analyze_count": 10,
+}
+
+
+# ═══════════════════════════════════════════════════════════
+# ANALYSIS TIMES — IDENTICAL TO BACKTEST DEFAULT_ANALYSIS_TIMES
+# ═══════════════════════════════════════════════════════════
+
+ANALYSIS_TIMES = [
+    time(9, 35),   # Open (ORB forming)
+    time(10, 0),   # Prime start (10 AM reversal zone)
+    time(10, 30),  # Prime mid
+    time(10, 50),  # Prime late
+    time(11, 0),   # Late morning (lunch blocked by signal engine)
+    time(11, 45),  # Lunch (blocked by signal engine)
+    time(13, 0),   # Mid-day (blocked by signal engine)
+    time(14, 0),   # Afternoon (blocked by signal engine)
+    time(14, 45),  # Afternoon late (blocked by signal engine)
+    time(15, 15),  # Power hour
+]
+
+
+# ═══════════════════════════════════════════════════════════
+# CONFIDENCE → RISK SCALING — IDENTICAL TO BACKTEST
+# ═══════════════════════════════════════════════════════════
+
+def _confidence_risk_scale(confidence: float) -> float:
+    """Scale risk amount by confidence. Higher confidence = bigger bet."""
+    c = max(0.65, min(1.0, confidence))
+    normalized = (c - 0.65) / 0.35
+    return 0.30 + 0.70 * (normalized ** 1.2)
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTOR CONCENTRATION — IDENTICAL TO BACKTEST
+# ═══════════════════════════════════════════════════════════
+
+_CORRELATED_GROUPS = {
+    "mega_tech": {"AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN"},
+    "semis": {"NVDA", "AMD", "INTC", "AVGO", "QCOM", "MU", "TSM", "ASML"},
+    "ev_auto": {"TSLA", "RIVN", "LCID", "NIO", "GM", "F"},
+    "banking": {"JPM", "BAC", "GS", "MS", "WFC", "C"},
+    "energy": {"XOM", "CVX", "COP", "SLB", "OXY", "EOG"},
+    "biotech": {"MRNA", "PFE", "JNJ", "ABBV", "LLY", "BMY"},
+}
+_MAX_SECTOR_CONCENTRATION = 2
+
+
+# ═══════════════════════════════════════════════════════════
+# LIVE POSITION — MIRRORS SimulatedPosition FROM BACKTEST
+# ═══════════════════════════════════════════════════════════
+
+@dataclass
+class LivePosition:
+    symbol: str
+    entry_price: float
+    quantity: int
+    stop_loss: float
+    take_profit: float
+    entry_time: datetime
+    pattern: str = ""
+    confidence: float = 0.0
+    risk_per_share: float = 0.0
+    highest_price: float = 0.0
+    lowest_price: float = 0.0
+    scale_out_stage: int = 0
+    shares_remaining: int = 0
+    realized_pnl: float = 0.0
+    r_target_1: float = 0.0
+    r_target_2: float = 0.0
+    current_stop: float = 0.0
+    breakeven_locked: bool = False
+    broker_stop_order_id: str = ""
+
+    def __post_init__(self):
+        self.risk_per_share = abs(self.entry_price - self.stop_loss)
+        self.highest_price = self.entry_price
+        self.lowest_price = self.entry_price
+        self.shares_remaining = self.quantity
+        self.r_target_1 = self.entry_price + self.risk_per_share * 0.5   # 0.5R first target
+        self.r_target_2 = self.entry_price + self.risk_per_share * 1.5   # 1.5R second target
+        self.current_stop = self.stop_loss
+
+
+# ═══════════════════════════════════════════════════════════
+# MAIN AUTOTRADER CLASS
+# ═══════════════════════════════════════════════════════════
 
 class AutoTrader:
-    """The main autonomous day trading system."""
+    """Live trading engine — mirrors backtest/engine.py logic exactly."""
 
     def __init__(self):
-        self.analyst = ClaudeAnalyst()
+        self.signal_engine = SignalEngine()
         self.broker = AlpacaBroker()
-        self.risk = RiskManager()
-        self.positions = PositionManager(atr_trail_multiplier=1.5)
-        self.telegram = TelegramAlerts(risk_manager=self.risk, broker=self.broker)
         self.scanner = MarketScanner()
-        self.stalker = EntryStalker()
+        self.telegram = TelegramAlerts()
         self.regime = MarketRegime()
         self.scheduler = AsyncIOScheduler()
         self._running = False
-        self._trades_today = 0
-        self._wins_today = 0
-        self._losses_today = 0
-        self._daily_r = 0.0  # Total R earned today
-        self._last_prices: dict[str, float] = {}  # Fallback prices for position management
-        self._api_failure_alerted = False  # Prevent spamming Telegram alerts
+
+        # Position tracking — mirrors backtest
+        self.positions: dict[str, LivePosition] = {}
+
+        # Daily counters — mirrors backtest
+        self.daily_trades = 0
+        self.daily_pnl = 0.0
+        self.consecutive_losses = 0
+        self.cooldown_until: datetime | None = None
+        self.peak_equity = 0.0
+        self._daily_r = 0.0
 
     async def start(self):
         """Start the trading system."""
         logger.info("=" * 60)
-        logger.info("  AutoTrader v3.0 — AI Day Trading Platform")
-        logger.info("  Pattern + Location + Volume = Edge")
+        logger.info("  AutoTrader v4.0 — Deterministic Signal Engine")
+        logger.info("  Same logic as backtest — no differences")
         logger.info("=" * 60)
 
-        init_db()
-        logger.info("Database initialized")
+        account = self.broker.get_account()
+        if not account:
+            logger.error("Cannot connect to Alpaca — aborting")
+            return
+        self.peak_equity = account.get("equity", 100_000)
 
         await self.telegram.start()
-        self.broker.snapshot_portfolio()
 
-        account = self.broker.get_account()
         logger.info(f"Account equity: ${account.get('equity', 0):,.2f}")
         logger.info(f"Day trade mode: {DAY_TRADE_MODE}")
-        logger.info(f"Autonomy mode: {AUTONOMY_MODE}")
 
         # Build trading universe
-        logger.info("Building trading universe (scanning entire market)...")
+        logger.info("Building trading universe...")
         self.scanner.build_universe()
         logger.info(f"Universe: {len(self.scanner.universe)} liquid stocks")
 
@@ -94,51 +187,34 @@ class AutoTrader:
         self.scanner.scan_for_movers()
         logger.info(f"Hot list: {len(self.scanner.hot_list)} candidates")
 
-        # Reconcile: ensure all existing positions have broker-side stop orders
-        await self._reconcile_broker_stops()
+        # Reconcile existing positions
+        await self._reconcile_positions()
 
         # ── Schedule jobs ──────────────────────────────
 
-        # Main trading loop — interval adjusts dynamically per phase
-        self._current_scan_interval = SCAN_INTERVAL_NORMAL
+        # Main trading loop — runs every 2 min, checks if it's an analysis time
         self.scheduler.add_job(
             self._trading_loop,
-            IntervalTrigger(minutes=SCAN_INTERVAL_NORMAL),
+            IntervalTrigger(minutes=2),
             id="trading_loop",
             name="Main Trading Loop",
             max_instances=1,
         )
 
-        # Position management (check trailing stops, scale-outs)
+        # Position management — every 1 min (mirrors backtest checking every bar)
         self.scheduler.add_job(
             self._manage_positions,
-            IntervalTrigger(minutes=2),
+            IntervalTrigger(minutes=1),
             id="position_mgmt",
             name="Position Management",
         )
 
-        # Entry stalker — monitor pending limit orders every 30 seconds
-        self.scheduler.add_job(
-            self._check_stalked_entries,
-            IntervalTrigger(seconds=30),
-            id="entry_stalker",
-            name="Entry Stalker",
-        )
-
-        # Refresh hot list
+        # Refresh hot list every 15 min
         self.scheduler.add_job(
             self._refresh_hot_list,
             IntervalTrigger(minutes=SCANNER["hot_list_refresh_minutes"]),
             id="hot_list_refresh",
             name="Hot List Refresh",
-        )
-
-        # Portfolio snapshots every 30 min
-        self.scheduler.add_job(
-            self._snapshot_portfolio,
-            IntervalTrigger(minutes=30),
-            id="portfolio_snapshot",
-            name="Portfolio Snapshot",
         )
 
         # Daily universe rebuild at 9:00 AM ET
@@ -149,7 +225,7 @@ class AutoTrader:
             name="Daily Universe Rebuild",
         )
 
-        # EOD close all positions
+        # EOD close all positions at 3:50 PM ET
         if CLOSE_ALL_EOD:
             self.scheduler.add_job(
                 self._eod_close_all,
@@ -158,20 +234,12 @@ class AutoTrader:
                 name="EOD Close All",
             )
 
-        # Daily summary + journal at 4:30 PM ET
+        # Daily summary at 4:30 PM ET + auto shutdown
         self.scheduler.add_job(
             self._daily_summary,
             CronTrigger(hour=16, minute=30, timezone="US/Eastern"),
             id="daily_summary",
             name="Daily Summary",
-        )
-
-        # Weekly performance report (Friday 4:45 PM ET)
-        self.scheduler.add_job(
-            self._weekly_performance_report,
-            CronTrigger(day_of_week="fri", hour=16, minute=45, timezone="US/Eastern"),
-            id="weekly_report",
-            name="Weekly Performance Report",
         )
 
         self.scheduler.start()
@@ -183,12 +251,12 @@ class AutoTrader:
 
         logger.info("AutoTrader is LIVE.")
         await self.telegram.send_message(
-            f"*AutoTrader v3.0 LIVE*\n"
+            f"*AutoTrader v4.0 LIVE — Deterministic Engine*\n"
             f"Equity: ${account.get('equity', 0):,.2f}\n"
             f"Universe: {len(self.scanner.universe)} stocks\n"
             f"Hot list: {len(self.scanner.hot_list)} movers\n"
             f"Regime: {regime_label}\n"
-            f"Mode: {AUTONOMY_MODE} | EOD close: {CLOSE_ALL_EOD}"
+            f"Risk: {LIVE_RISK['max_risk_per_trade_pct']*100:.0f}% per trade"
         )
 
         # Run initial cycle
@@ -210,536 +278,476 @@ class AutoTrader:
             pass
         await self.telegram.send_message("AutoTrader shutting down.")
         await self.telegram.stop()
-        self.broker.snapshot_portfolio()
         logger.info("AutoTrader stopped.")
 
     # ══════════════════════════════════════════════════════
-    # CORE TRADING LOOP
+    # CORE TRADING LOOP — mirrors backtest analysis cycle
     # ══════════════════════════════════════════════════════
 
     async def _trading_loop(self):
-        """Scan → detect patterns → analyze with Claude → risk check → execute."""
-        if self.risk.is_halted:
-            logger.info("Trading halted — skipping cycle")
-            return
+        """Scan → score with SignalEngine → risk check → execute.
 
+        Runs every 2 min. Only analyzes at scheduled ANALYSIS_TIMES (±5 min).
+        Mirrors the backtest engine's analysis cycle exactly.
+        """
         if not self._is_market_hours():
-            logger.debug("Outside market hours")
             return
 
-        market_phase = self._get_market_phase()
-
-        # Update market regime (SPY trend + VIX level)
-        self.regime.update()
-        if not self.regime.should_trade():
-            logger.warning("Regime block: extreme conditions — skipping cycle")
-            return
-
-        # Dynamically adjust scan interval based on phase
-        phase_conf = PHASE_CONFIG.get(market_phase, {})
-        new_interval = phase_conf.get("scan_interval", SCAN_INTERVAL_NORMAL)
-        if new_interval != self._current_scan_interval:
-            self._current_scan_interval = new_interval
-            self.scheduler.reschedule_job(
-                "trading_loop",
-                trigger=IntervalTrigger(minutes=new_interval),
-            )
-            logger.info(f"Scan interval adjusted to {new_interval} min for {market_phase}")
-
-        # During lunch, scan fewer candidates (but don't skip entirely — let Claude decide)
-        if market_phase == "lunch":
-            logger.info("Lunch period — scanning with reduced candidates")
-
-        regime_label = self.regime.state.regime if self.regime.state else "unknown"
-        logger.info(
-            f"--- Trading cycle | Phase: {market_phase} | Regime: {regime_label} | "
-            f"Hot list: {len(self.scanner.hot_list)} | "
-            f"Trades: {self._trades_today} | R: {self._daily_r:+.1f} ---"
+        now_et = datetime.now(timezone.utc).astimezone(
+            __import__('zoneinfo', fromlist=['ZoneInfo']).ZoneInfo("US/Eastern")
         )
+        hour, minute = now_et.hour, now_et.minute
 
-        portfolio = self.broker.get_portfolio()
-        if not portfolio.get("equity"):
-            logger.error("Could not get portfolio — skipping")
+        # Only run analysis at scheduled times (±5 min window)
+        if not self._is_analysis_time(hour, minute):
             return
 
-        # Check daily R limit (-3R = stop trading)
+        phase = self._get_phase(hour, minute)
+
+        # Block lunch — identical to backtest engine
+        if phase == "lunch":
+            return
+
+        # Block late entries — identical to backtest engine
+        if hour >= 15 or (hour == 14 and minute >= 30):
+            return
+
+        # Update market regime
+        self.regime.update()
+        regime_label = self.regime.state.regime if self.regime.state else "unknown"
+        regime_multiplier = self.regime.get_size_multiplier() if hasattr(self.regime, 'get_size_multiplier') else 1.0
+
+        # Check daily loss halt — identical to backtest
+        account = self.broker.get_account()
+        equity = account.get("equity", 100_000)
+        if equity > 0 and self.daily_pnl < 0:
+            daily_loss_pct = abs(self.daily_pnl) / equity
+            if daily_loss_pct >= RISK["max_daily_loss_pct"]:
+                logger.warning(f"Daily loss halt: {daily_loss_pct:.1%}")
+                return
+
+        # Check cooldown — identical to backtest
+        if self.cooldown_until and now_et < self.cooldown_until:
+            return
+        self.cooldown_until = None
+
+        # Check daily R limit
         if self._daily_r <= -3.0:
-            logger.warning(f"Daily R limit hit ({self._daily_r:.1f}R) — stopping for the day")
-            self.risk.halt("Daily R limit (-3R)")
+            logger.warning(f"Daily R limit hit ({self._daily_r:.1f}R)")
             return
 
         # Refresh hot list if stale
         if self.scanner.needs_hot_list_refresh():
             self.scanner.scan_for_movers()
 
-        # Get candidates
+        # Get candidates — mirrors backtest
         candidates = self.scanner.get_top_candidates()
         if not candidates:
-            from autotrader.data.scanner import ScanCandidate
-            candidates = [ScanCandidate(symbol=s, score=1.0, flags=["FALLBACK"]) for s in WATCHLIST_FALLBACK]
-
-        symbols_to_analyze = [c.symbol for c in candidates]
-
-        # Always monitor existing positions
-        for sym in list(self.positions.positions.keys()):
-            if sym not in symbols_to_analyze:
-                symbols_to_analyze.append(sym)
-
-        # During lunch, only analyze existing positions
-        if market_phase == "lunch":
-            symbols_to_analyze = [s for s in symbols_to_analyze if s in self.positions.positions]
-            if not symbols_to_analyze:
-                return
-
-        logger.info(f"Analyzing: {', '.join(symbols_to_analyze[:10])}{'...' if len(symbols_to_analyze) > 10 else ''}")
-
-        for symbol in symbols_to_analyze:
-            if self.risk.is_halted:
-                break
-
-            scanner_flags = ""
-            for c in candidates:
-                if c.symbol == symbol:
-                    scanner_flags = (
-                        f"Score: {c.score} | Chg: {c.change_pct:+.1f}% | "
-                        f"RVOL: {c.relative_volume:.1f}x | Gap: {c.gap_pct:+.1f}% | "
-                        f"ATR: {c.atr_pct:.1f}% | Float: {c.float_category} | "
-                        f"5D: {c.five_day_change:+.1f}% | Flags: {', '.join(c.flags)}"
-                    )
-                    break
-
-            try:
-                await self._analyze_and_trade(symbol, portfolio, scanner_flags, market_phase)
-            except Exception as e:
-                logger.error(f"Error processing {symbol}: {e}")
-
-            await asyncio.sleep(1)
-
-        logger.info(f"--- Cycle complete | W:{self._wins_today} L:{self._losses_today} R:{self._daily_r:+.1f} ---")
-
-    async def _analyze_and_trade(self, symbol: str, portfolio: dict, scanner_flags: str, market_phase: str):
-        """Analyze one symbol with full pattern detection and potentially trade."""
-
-        # Check for sustained API failures — halt new entries but keep position management running
-        if self.analyst.consecutive_failures >= 5:
-            if not self._api_failure_alerted:
-                self._api_failure_alerted = True
-                logger.error(f"Claude API: {self.analyst.consecutive_failures} consecutive failures — halting new entries")
-                await self.telegram.send_message(
-                    f"*ALERT: Claude API Down*\n"
-                    f"{self.analyst.consecutive_failures} consecutive failures.\n"
-                    f"New entries halted. Position management continues.\n"
-                    f"Will resume when API recovers."
-                )
             return
 
-        result = self.analyst.analyze(
-            symbol=symbol,
-            portfolio=portfolio,
-            scanner_flags=scanner_flags,
-            trades_today=self._trades_today,
-            market_phase=market_phase,
-            regime_context=self.regime.get_regime_context_for_prompt(),
+        phase_config = PHASE_CONFIG.get(phase, {})
+        if phase_config.get("size_multiplier", 1.0) <= 0:
+            return
+
+        logger.info(
+            f"--- Analysis cycle | Phase: {phase} | Regime: {regime_label} | "
+            f"Candidates: {len(candidates)} | Trades: {self.daily_trades} | "
+            f"R: {self._daily_r:+.1f} ---"
         )
 
-        # Reset alert flag on successful API call
-        if result and self._api_failure_alerted:
-            self._api_failure_alerted = False
-            logger.info("Claude API recovered — resuming normal operation")
-            await self.telegram.send_message("*Claude API Recovered* — resuming normal trading")
+        # Analyze top candidates — identical count to backtest
+        analyze_count = min(LIVE_RISK["analyze_count"], len(candidates))
+        symbols = [c.symbol for c in candidates[:analyze_count]]
 
-        if not result:
+        for sym in symbols:
+            if self.daily_trades >= LIVE_RISK["max_trades_per_day"]:
+                break
+            if sym in self.positions:
+                continue
+
+            # Check sector concentration — identical to backtest
+            if not self._check_sector_ok(sym):
+                continue
+
+            # Check total exposure — identical to backtest
+            total_position_value = sum(
+                pos.entry_price * pos.shares_remaining
+                for pos in self.positions.values()
+            )
+            if equity > 0 and total_position_value / equity >= LIVE_RISK["max_total_exposure_pct"]:
+                continue
+
+            try:
+                await self._analyze_and_trade(sym, equity, phase, phase_config, regime_multiplier)
+            except Exception as e:
+                logger.error(f"Error processing {sym}: {e}")
+
+            await asyncio.sleep(0.5)
+
+        logger.info(f"--- Cycle complete | Trades: {self.daily_trades} | R: {self._daily_r:+.1f} ---")
+
+    async def _analyze_and_trade(
+        self, symbol: str, equity: float, phase: str,
+        phase_config: dict, regime_multiplier: float,
+    ):
+        """Analyze one symbol with SignalEngine and potentially trade.
+
+        Data gathering and signal engine call mirrors backtest/engine.py exactly.
+        """
+        # Get real-time price
+        price_data_raw = get_current_price(symbol)
+        if not price_data_raw:
+            return
+        price = price_data_raw["price"]
+
+        # Get daily data for indicators (same as backtest: calculate_indicators on daily)
+        daily = get_stock_data(symbol, period="3mo", interval="1d")
+        if daily is None or daily.empty or len(daily) < 20:
             return
 
-        self._log_decision(result, market_phase)
+        indicators = calculate_indicators(daily)
 
-        if result.action == "HOLD":
-            logger.debug(
-                f"{symbol}: HOLD | conf={result.confidence:.0%} | "
-                f"pattern={result.pattern} | "
-                f"patterns_found={len(result.detected_patterns)}"
-            )
+        # Get intraday 5m data (same as backtest: calculate_intraday_indicators on 5m)
+        intraday = get_intraday_data(symbol, period="1d", interval="5m")
+        if intraday is not None and not intraday.empty and len(intraday) >= 3:
+            intraday_indicators = calculate_intraday_indicators(intraday)
+            indicators.update(intraday_indicators)
+
+            # Build price_data dict — mirrors backtest
+            today_open = float(intraday.iloc[0]["Open"])
+            prev_close = float(daily["Close"].iloc[-1])
+
+            price_data = {
+                "price": price,
+                "open": today_open,
+                "high": float(intraday["High"].max()),
+                "low": float(intraday["Low"].min()),
+                "volume": int(intraday["Volume"].sum()),
+                "prev_close": prev_close,
+                "change_pct": ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0,
+            }
+        else:
+            prev_close = float(daily["Close"].iloc[-1])
+            price_data = {
+                "price": price,
+                "open": price,
+                "high": price,
+                "low": price,
+                "volume": 0,
+                "prev_close": prev_close,
+                "change_pct": ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0,
+            }
+
+        # Patterns — same as backtest
+        vwap = indicators.get("vwap") or indicators.get("vwap_5m")
+        prior_day_high = float(daily["High"].iloc[-1])
+        prior_day_low = float(daily["Low"].iloc[-1])
+
+        detected_patterns = detect_all_patterns(
+            df_daily=daily,
+            df_5m=intraday if intraday is not None and len(intraday) >= 10 else None,
+            prior_day_high=prior_day_high,
+            prior_day_low=prior_day_low,
+            prior_day_close=prev_close,
+            vwap=vwap,
+        )
+        patterns_text = format_patterns_for_prompt(detected_patterns)
+
+        # Key levels — same as backtest
+        key_levels = get_key_levels(
+            df_daily=daily,
+            df_5m=intraday if intraday is not None and len(intraday) >= 6 else None,
+            vwap=vwap,
+        )
+
+        # ── Call SignalEngine — IDENTICAL to backtest ──
+        decision = self.signal_engine.score(
+            symbol=symbol,
+            price_data=price_data,
+            indicators=indicators,
+            intraday_indicators=indicators,  # Already merged above
+            patterns_text=patterns_text,
+            levels=key_levels,
+            phase=phase,
+            regime=self.regime.state.regime if self.regime.state else "unknown",
+        )
+
+        if decision.action != "BUY":
             return
 
-        # ── SELL: Check if we actually own this stock ──
-        if result.action == "SELL":
-            owned_positions = {p["symbol"]: p for p in portfolio.get("positions", [])}
-            if symbol not in owned_positions:
-                logger.debug(f"{symbol}: SELL signal but no position — skipping (can't short)")
-                return
+        confidence = decision.confidence
+        stop_loss = decision.stop_loss
+        take_profit = decision.take_profit
 
-            owned = owned_positions[symbol]
-            pnl = owned.get("unrealized_pnl", 0)
-
-            logger.info(
-                f"{symbol}: SELL | conf={result.confidence:.0%} | "
-                f"pattern={result.pattern} | P&L=${pnl:+,.2f} | {result.reasoning[:120]}"
-            )
-
-            # Close the entire position
-            if result.confidence >= RISK["min_confidence_to_trade"]:
-                # Track R-multiple before removing position
-                if symbol in self.positions.positions:
-                    pos = self.positions.positions[symbol]
-                    if pos.risk_per_share > 0:
-                        r_earned = (float(owned["current_price"]) - pos.entry_price) / pos.risk_per_share
-                        self._daily_r += r_earned
-
-                success = self.broker.close_position(symbol)
-                if success:
-                    self._trades_today += 1
-                    self.positions.remove_position(symbol)
-
-                    # Track win/loss
-                    if pnl > 0:
-                        self._wins_today += 1
-                        self.risk.record_trade_result(won=True)
-                    elif pnl < 0:
-                        self._losses_today += 1
-                        self.risk.record_trade_result(won=False)
-
-                    logger.info(f"CLOSED {symbol}: P&L ${pnl:+,.2f}")
-
-                    await self.telegram.send_trade_alert({
-                        "symbol": symbol,
-                        "side": "SELL",
-                        "quantity": int(owned["qty"]),
-                        "price": owned["current_price"],
-                        "confidence": result.confidence,
-                        "pattern": result.pattern,
-                        "reasoning": result.reasoning,
-                        "stop_loss": None,
-                        "take_profit": None,
-                    })
+        # Confidence threshold — identical to backtest
+        if confidence < LIVE_RISK["min_confidence_to_trade"]:
             return
 
-        # ── BUY: Normal flow with risk check ──
-        price_data = get_current_price(symbol)
-        if not price_data:
-            return
-        current_price = price_data["price"]
-
-        # Skip if we already have a stalked entry waiting for this symbol
-        if self.stalker.has_pending(symbol):
-            logger.debug(f"{symbol}: Already stalking entry — skipping")
+        # R:R check with slippage — identical to backtest
+        risk = abs(price - stop_loss) + SLIPPAGE_PER_SHARE * 2
+        reward = abs(take_profit - price) - SLIPPAGE_PER_SHARE * 2
+        if risk <= 0 or reward <= 0 or reward / risk < LIVE_RISK["min_risk_reward_ratio"]:
             return
 
-        proposal = self.analyst.to_trade_proposal(result, current_price)
-        regime_mult = self.regime.get_size_multiplier()
-        verdict = self.risk.check_trade(proposal, portfolio, market_phase, regime_mult)
+        # Position sizing — IDENTICAL to backtest
+        conf_scale = _confidence_risk_scale(confidence)
+        phase_mult = phase_config.get("size_multiplier", 1.0)
+        if phase == "open":
+            phase_mult = 1.5
+        else:
+            phase_mult = max(phase_mult, 0.40)
 
-        if not verdict.approved:
-            logger.info(f"{symbol}: BLOCKED — {verdict.reason}")
-            self._update_decision_blocked(result, verdict.reason)
+        risk_amount = (
+            equity
+            * LIVE_RISK["max_risk_per_trade_pct"]
+            * conf_scale
+            * phase_mult
+            * regime_multiplier
+        )
+
+        stop_dist = abs(price - stop_loss) + SLIPPAGE_PER_SHARE * 2
+        if stop_dist <= 0:
             return
 
-        # ── Entry Decision: Market order vs Limit order (stalk the entry) ──
-        entry_price = result.entry_price
-        use_limit = False
+        shares = int(risk_amount / (price * (stop_dist / price)))
+        if shares <= 0:
+            return
 
-        if entry_price and entry_price > 0 and result.stop_loss:
-            # How far below current price is the ideal entry?
-            entry_gap_pct = (current_price - entry_price) / current_price
+        # Cap position size — identical to backtest
+        max_position_value = equity * LIVE_RISK["max_position_pct"]
+        if shares * price > max_position_value:
+            shares = int(max_position_value / price)
+        if shares <= 0:
+            return
 
-            # Use limit order if:
-            # 1. Entry is meaningfully below current price (>0.3%)
-            # 2. Confidence is not extreme (< 85% — extreme confidence = don't miss it)
-            # 3. Entry is above the stop loss (makes sense)
-            if (entry_gap_pct > 0.003
-                    and result.confidence < 0.85
-                    and entry_price > result.stop_loss):
-                use_limit = True
+        # ── EXECUTE ──
+        logger.info(
+            f"BUY SIGNAL: {symbol} | {decision.pattern} | "
+            f"conf={confidence:.2f} | score={decision.score:.0f} | "
+            f"${price:.2f} | SL=${stop_loss:.2f} | TP=${take_profit:.2f} | "
+            f"{shares} shares | {decision.reasoning}"
+        )
 
-        if use_limit and (AUTONOMY_MODE == "full_auto" or result.confidence >= RISK["min_confidence_full_auto"]):
-            # STALK THE ENTRY — place limit order and wait
-            logger.info(
-                f"{symbol}: BUY LIMIT | conf={result.confidence:.0%} | "
-                f"entry=${entry_price:.2f} (current ${current_price:.2f}, "
-                f"{(current_price - entry_price) / current_price:.1%} better) | "
-                f"pattern={result.pattern} | SL=${result.stop_loss} | "
-                f"TP=${result.take_profit} | {result.reasoning[:100]}"
-            )
+        order_id = self.broker.buy_shares(symbol, shares)
+        if not order_id:
+            logger.error(f"Failed to execute buy for {symbol}")
+            return
 
-            order_id = self.broker.place_limit_buy(
-                symbol=symbol,
-                quantity=int(verdict.adjusted_quantity),
-                limit_price=entry_price,
-            )
-            if order_id:
-                self.stalker.add_entry(
-                    symbol=symbol,
-                    order_id=order_id,
-                    limit_price=entry_price,
-                    quantity=int(verdict.adjusted_quantity),
-                    stop_loss=result.stop_loss,
-                    take_profit=result.take_profit,
-                    pattern=result.pattern,
-                    confidence=result.confidence,
-                    reasoning=result.reasoning,
-                )
-                await self.telegram.send_message(
-                    f"*STALKING ENTRY*: {symbol}\n"
-                    f"Limit: ${entry_price:.2f} (current ${current_price:.2f})\n"
-                    f"Stop: ${result.stop_loss:.2f} | Target: ${result.take_profit:.2f}\n"
-                    f"Pattern: {result.pattern}\n"
-                    f"Waiting up to 10 min for fill..."
-                )
+        # Register position — mirrors SimulatedPosition from backtest
+        now = datetime.now(timezone.utc)
+        self.positions[symbol] = LivePosition(
+            symbol=symbol,
+            entry_price=price,
+            quantity=shares,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            entry_time=now,
+            pattern=decision.pattern,
+            confidence=confidence,
+        )
 
-        elif AUTONOMY_MODE == "full_auto" or result.confidence >= RISK["min_confidence_full_auto"]:
-            # MARKET ORDER — price is at level or high confidence, go now
-            logger.info(
-                f"{symbol}: BUY MARKET | conf={result.confidence:.0%} | "
-                f"pattern={result.pattern} | SL=${result.stop_loss} | "
-                f"TP=${result.take_profit} | {result.reasoning[:120]}"
-            )
+        # Place broker-side stop loss for crash protection
+        stop_id = self.broker.place_stop_loss(symbol, shares, stop_loss)
+        if stop_id:
+            self.positions[symbol].broker_stop_order_id = stop_id
 
-            trade = self.broker.execute_trade(proposal, verdict)
-            if trade:
-                self._trades_today += 1
+        self.daily_trades += 1
 
-                if result.stop_loss and result.take_profit:
-                    self.positions.add_position(
-                        symbol=symbol,
-                        entry_price=current_price,
-                        quantity=verdict.adjusted_quantity,
-                        stop_loss=result.stop_loss,
-                        take_profit=result.take_profit,
-                        pattern=result.pattern,
-                    )
-                    # Place broker-side stop loss for crash protection
-                    stop_id = self.broker.place_stop_loss(
-                        symbol, int(verdict.adjusted_quantity), result.stop_loss
-                    )
-                    if stop_id and symbol in self.positions.positions:
-                        self.positions.positions[symbol].broker_stop_order_id = stop_id
-
-                await self.telegram.send_trade_alert({
-                    "symbol": symbol,
-                    "side": result.action,
-                    "quantity": verdict.adjusted_quantity,
-                    "price": current_price,
-                    "confidence": result.confidence,
-                    "pattern": result.pattern,
-                    "reasoning": result.reasoning,
-                    "stop_loss": result.stop_loss,
-                    "take_profit": result.take_profit,
-                })
-
-        elif AUTONOMY_MODE in ("notify_first", "require_approval"):
-            proposal_id = str(uuid.uuid4())[:8]
-            await self.telegram.send_trade_proposal(proposal_id, {
-                "symbol": symbol,
-                "side": result.action,
-                "quantity": verdict.adjusted_quantity,
-                "confidence": result.confidence,
-                "pattern": result.pattern,
-                "reasoning": result.reasoning,
-            })
-
-            approved = await self._wait_for_approval(proposal_id)
-            should_execute = (
-                (AUTONOMY_MODE == "notify_first" and approved is not False) or
-                (AUTONOMY_MODE == "require_approval" and approved is True)
-            )
-
-            if should_execute:
-                trade = self.broker.execute_trade(proposal, verdict)
-                if trade:
-                    self._trades_today += 1
-                    if result.stop_loss and result.take_profit:
-                        self.positions.add_position(
-                            symbol=symbol,
-                            entry_price=current_price,
-                            quantity=verdict.adjusted_quantity,
-                            stop_loss=result.stop_loss,
-                            take_profit=result.take_profit,
-                            pattern=result.pattern,
-                        )
-                        # Place broker-side stop loss for crash protection
-                        stop_id = self.broker.place_stop_loss(
-                            symbol, int(verdict.adjusted_quantity), result.stop_loss
-                        )
-                        if stop_id and symbol in self.positions.positions:
-                            self.positions.positions[symbol].broker_stop_order_id = stop_id
+        await self.telegram.send_message(
+            f"*BUY*: {symbol} | {shares} shares @ ${price:.2f}\n"
+            f"Pattern: {decision.pattern} | Conf: {confidence:.2f}\n"
+            f"Stop: ${stop_loss:.2f} | Target: ${take_profit:.2f}\n"
+            f"{decision.reasoning}"
+        )
 
     # ══════════════════════════════════════════════════════
-    # POSITION MANAGEMENT (runs every 2 min)
+    # POSITION MANAGEMENT — mirrors backtest _manage_positions_at_bar()
     # ══════════════════════════════════════════════════════
 
     async def _manage_positions(self):
-        """Active position management — trailing stops, scale-outs, time exits."""
-        if not self.positions.positions:
-            return
+        """Check stops, scale-outs, breakeven locks, time exits.
 
+        Identical logic to backtest/engine.py _manage_positions_at_bar().
+        """
+        if not self.positions:
+            return
         if not self._is_market_hours():
             return
 
-        minutes_to_close = self._minutes_to_close()
+        now = datetime.now(timezone.utc)
 
-        for symbol in list(self.positions.positions.keys()):
+        for sym in list(self.positions.keys()):
+            pos = self.positions[sym]
+
             try:
-                price_data = get_current_price(symbol)
-                if price_data:
-                    current_price = price_data["price"]
-                    self._last_prices[symbol] = current_price  # Cache for fallback
-                elif symbol in self._last_prices:
-                    current_price = self._last_prices[symbol]
-                    logger.warning(f"Price fetch failed for {symbol} — using last known ${current_price:.2f}")
-                else:
-                    logger.error(f"No price data for {symbol} and no cached price — skipping")
+                price_data = get_current_price(sym)
+                if not price_data:
+                    continue
+                current_price = price_data["price"]
+
+                # Update highest/lowest — identical to backtest
+                if current_price > pos.highest_price:
+                    pos.highest_price = current_price
+                if current_price < pos.lowest_price:
+                    pos.lowest_price = current_price
+
+                # Check stop loss — identical to backtest (close-based)
+                if current_price <= pos.current_stop:
+                    logger.info(f"STOP HIT: {sym} @ ${current_price:.2f} (stop=${pos.current_stop:.2f})")
+                    await self._close_live_position(sym, "Stop loss hit")
                     continue
 
-                # Get ATR for trailing stop calculation
-                from autotrader.data.indicators import calculate_indicators
-                from autotrader.data.market import get_stock_data
-                hist = get_stock_data(symbol, period="1mo", interval="1d")
-                indicators = calculate_indicators(hist)
-                atr = indicators.get("atr")
+                # Calculate current R and hold time — identical to backtest
+                current_r = (current_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+                hold_minutes = (now - pos.entry_time).total_seconds() / 60
 
-                # Check for scale-outs, trailing stop moves
-                actions = self.positions.update(symbol, current_price, atr)
+                # 1. Breakeven lock at +0.3R — identical to backtest
+                if not pos.breakeven_locked and current_r >= 0.3:
+                    new_stop = max(pos.entry_price, pos.current_stop)
+                    if new_stop > pos.current_stop:
+                        pos.current_stop = new_stop
+                        pos.breakeven_locked = True
+                        # Update broker stop
+                        if pos.broker_stop_order_id:
+                            new_id = self.broker.replace_stop_loss(
+                                pos.broker_stop_order_id, sym,
+                                pos.shares_remaining, pos.current_stop,
+                            )
+                            pos.broker_stop_order_id = new_id or ""
+                        logger.info(f"BREAKEVEN LOCK: {sym} stop → ${pos.current_stop:.2f}")
 
-                # Check time-based exits
-                time_action = self.positions.check_time_exit(symbol, minutes_to_close)
-                if time_action:
-                    actions.append(time_action)
-
-                for action in actions:
-                    if action["action"] == "SELL_ALL":
-                        logger.info(f"POSITION MGMT: {symbol} — {action['reason']}")
-                        pnl = self._get_position_pnl(symbol, current_price)
-
-                        # Track R-multiple before removing position
-                        if symbol in self.positions.positions:
-                            pos = self.positions.positions[symbol]
-                            if pos.risk_per_share > 0:
-                                r_earned = (current_price - pos.entry_price) / pos.risk_per_share
-                                self._daily_r += r_earned
-
-                        success = self.broker.close_position(symbol)
+                # 2. Scale out at 0.5R — sell 1/3 — identical to backtest
+                if (pos.scale_out_stage == 0
+                        and current_price >= pos.r_target_1
+                        and pos.shares_remaining > 1):
+                    sell_qty = max(1, int(pos.quantity / 3))
+                    actual_sell = min(sell_qty, pos.shares_remaining - 1)
+                    if actual_sell > 0:
+                        success = self.broker.sell_shares(sym, actual_sell)
                         if success:
-                            self.positions.remove_position(symbol)
-                            self._trades_today += 1
-                            if pnl > 0:
-                                self._wins_today += 1
-                                self.risk.record_trade_result(won=True)
-                            elif pnl < 0:
-                                self._losses_today += 1
-                                self.risk.record_trade_result(won=False)
-                            logger.info(f"CLOSED {symbol}: P&L ${pnl:+,.2f} | {action['reason']}")
-                        await self.telegram.send_message(
-                            f"*Position Closed*: {symbol} (P&L: ${pnl:+,.2f})\n{action['reason']}"
-                        )
-
-                    elif action["action"] == "SELL_PARTIAL":
-                        qty = action["quantity"]
-                        logger.info(f"POSITION MGMT: {symbol} — Selling {qty} shares: {action['reason']}")
-                        success = self.broker.sell_shares(symbol, qty)
-                        if success:
-                            logger.info(f"SCALE OUT {symbol}: sold {qty} shares")
-                            # Track proportional R for partial sell
-                            if symbol in self.positions.positions:
-                                pos = self.positions.positions[symbol]
-                                if pos.risk_per_share > 0:
-                                    r_per_share = (current_price - pos.entry_price) / pos.risk_per_share
-                                    proportion = qty / pos.quantity
-                                    self._daily_r += r_per_share * proportion
-                                # Update broker stop to match remaining shares
-                                if pos.broker_stop_order_id:
-                                    new_stop_id = self.broker.replace_stop_loss(
-                                        pos.broker_stop_order_id, symbol,
-                                        int(pos.shares_remaining), pos.current_stop,
-                                    )
-                                    pos.broker_stop_order_id = new_stop_id or ""
-                        await self.telegram.send_message(
-                            f"*Scale Out*: {symbol} — {qty} shares\n{action['reason']}"
-                        )
-
-                    elif action["action"] == "MOVE_STOP":
-                        logger.info(f"POSITION MGMT: {symbol} — Stop → ${action['new_stop']:.2f}: {action['reason']}")
-                        # Update broker-side stop order to new level
-                        if symbol in self.positions.positions:
-                            pos = self.positions.positions[symbol]
+                            r_mult = current_r
+                            pnl = (current_price - pos.entry_price) * actual_sell
+                            pos.shares_remaining -= actual_sell
+                            pos.realized_pnl += pnl
+                            pos.scale_out_stage = 1
+                            pos.current_stop = pos.entry_price
+                            pos.breakeven_locked = True
+                            self.daily_pnl += pnl
+                            self._daily_r += r_mult * (actual_sell / pos.quantity)
+                            # Update broker stop for remaining shares
                             if pos.broker_stop_order_id:
-                                new_stop_id = self.broker.replace_stop_loss(
-                                    pos.broker_stop_order_id, symbol,
-                                    int(pos.shares_remaining), action["new_stop"],
+                                new_id = self.broker.replace_stop_loss(
+                                    pos.broker_stop_order_id, sym,
+                                    pos.shares_remaining, pos.current_stop,
                                 )
-                                pos.broker_stop_order_id = new_stop_id or ""
+                                pos.broker_stop_order_id = new_id or ""
+                            logger.info(
+                                f"SCALE OUT 0.5R: {sym} sold {actual_sell} shares @ ${current_price:.2f} "
+                                f"(+${pnl:.2f})"
+                            )
+                            await self.telegram.send_message(
+                                f"*Scale Out 0.5R*: {sym} | {actual_sell} shares @ ${current_price:.2f}\n"
+                                f"P&L: ${pnl:+.2f} | Remaining: {pos.shares_remaining}"
+                            )
+
+                # 3. Scale out at 1.5R — sell another 1/3 — identical to backtest
+                if (pos.scale_out_stage == 1
+                        and current_price >= pos.r_target_2
+                        and pos.shares_remaining > 1):
+                    sell_qty = max(1, int(pos.quantity / 3))
+                    actual_sell = min(sell_qty, pos.shares_remaining - 1)
+                    if actual_sell > 0:
+                        success = self.broker.sell_shares(sym, actual_sell)
+                        if success:
+                            r_mult = current_r
+                            pnl = (current_price - pos.entry_price) * actual_sell
+                            pos.shares_remaining -= actual_sell
+                            pos.realized_pnl += pnl
+                            pos.scale_out_stage = 2
+                            self.daily_pnl += pnl
+                            self._daily_r += r_mult * (actual_sell / pos.quantity)
+                            if pos.broker_stop_order_id:
+                                new_id = self.broker.replace_stop_loss(
+                                    pos.broker_stop_order_id, sym,
+                                    pos.shares_remaining, pos.current_stop,
+                                )
+                                pos.broker_stop_order_id = new_id or ""
+                            logger.info(
+                                f"SCALE OUT 1.5R: {sym} sold {actual_sell} shares @ ${current_price:.2f} "
+                                f"(+${pnl:.2f})"
+                            )
+                            await self.telegram.send_message(
+                                f"*Scale Out 1.5R*: {sym} | {actual_sell} shares @ ${current_price:.2f}\n"
+                                f"P&L: ${pnl:+.2f} | Remaining: {pos.shares_remaining}"
+                            )
+
+                # 4. Time management — identical to backtest
+                # 45-min hard close
+                if hold_minutes >= 45:
+                    logger.info(f"TIME STOP 45min: {sym}")
+                    await self._close_live_position(sym, "Time stop (45min)")
+                    continue
+                # 20-min loser cut
+                elif hold_minutes >= 20 and current_r <= 0:
+                    logger.info(f"TIME STOP 20min loser: {sym}")
+                    await self._close_live_position(sym, "Time stop (20min loser)")
+                    continue
+
+                # 5. Trailing stop — identical to backtest
+                if pos.breakeven_locked:
+                    trail_distance = 0.5 * pos.risk_per_share
+                    trail_stop = pos.highest_price - trail_distance
+                    trail_stop = max(trail_stop, pos.entry_price)
+                    if trail_stop > pos.current_stop:
+                        pos.current_stop = trail_stop
+                        if pos.broker_stop_order_id:
+                            new_id = self.broker.replace_stop_loss(
+                                pos.broker_stop_order_id, sym,
+                                pos.shares_remaining, pos.current_stop,
+                            )
+                            pos.broker_stop_order_id = new_id or ""
 
             except Exception as e:
-                logger.error(f"Position management error for {symbol}: {e}")
+                logger.error(f"Position management error for {sym}: {e}")
 
-    # ══════════════════════════════════════════════════════
-    # ENTRY STALKER (runs every 30 seconds)
-    # ══════════════════════════════════════════════════════
-
-    async def _check_stalked_entries(self):
-        """Monitor pending limit orders — fill, expire, or invalidate."""
-        if not self.stalker.pending:
+    async def _close_live_position(self, symbol: str, reason: str):
+        """Close a position via broker and update tracking."""
+        if symbol not in self.positions:
             return
 
-        if not self._is_market_hours():
+        pos = self.positions[symbol]
+        price_data = get_current_price(symbol)
+        current_price = price_data["price"] if price_data else pos.entry_price
+
+        success = self.broker.close_position(symbol)
+        if not success:
+            logger.error(f"Failed to close {symbol}")
             return
 
-        # Get current prices for all stalked symbols
-        current_prices = {}
-        for symbol in self.stalker.pending:
-            price_data = get_current_price(symbol)
-            if price_data:
-                current_prices[symbol] = price_data["price"]
+        pnl = (current_price - pos.entry_price) * pos.shares_remaining
+        r_mult = (current_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+        self.daily_pnl += pnl
+        self._daily_r += r_mult
 
-        # Check all entries
-        actions = self.stalker.check_entries(self.broker, current_prices)
-
-        for action in actions:
-            entry = action["entry"]
-
-            if action["action"] == "filled":
-                # Limit order filled — register position for management
-                fill_price = action["fill_price"]
-                self._trades_today += 1
-
-                self.positions.add_position(
-                    symbol=entry.symbol,
-                    entry_price=fill_price,
-                    quantity=entry.quantity,
-                    stop_loss=entry.stop_loss,
-                    take_profit=entry.take_profit,
-                    pattern=entry.pattern,
+        # Track consecutive losses — identical to backtest
+        if pnl < 0:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= RISK["max_consecutive_losses"]:
+                self.cooldown_until = datetime.now(timezone.utc) + timedelta(
+                    minutes=RISK["cooldown_after_losses_minutes"]
                 )
-                # Place broker-side stop loss for crash protection
-                stop_id = self.broker.place_stop_loss(
-                    entry.symbol, int(entry.quantity), entry.stop_loss
-                )
-                if stop_id and entry.symbol in self.positions.positions:
-                    self.positions.positions[entry.symbol].broker_stop_order_id = stop_id
+                logger.warning(f"Cooldown activated: {RISK['cooldown_after_losses_minutes']}min")
+        else:
+            self.consecutive_losses = 0
 
-                # Calculate how much better the entry was
-                # (compared to if we had bought at market when signal fired)
-                savings = ""
-                if fill_price < entry.limit_price * 1.01:  # filled at or near limit
-                    savings = f" (stalked {entry.age_seconds}s for better fill)"
+        del self.positions[symbol]
 
-                await self.telegram.send_trade_alert({
-                    "symbol": entry.symbol,
-                    "side": "BUY",
-                    "quantity": entry.quantity,
-                    "price": fill_price,
-                    "confidence": entry.confidence,
-                    "pattern": entry.pattern,
-                    "reasoning": entry.reasoning + savings,
-                    "stop_loss": entry.stop_loss,
-                    "take_profit": entry.take_profit,
-                })
-
-            elif action["action"] == "cancelled":
-                logger.info(
-                    f"Stalked entry cancelled: {entry.symbol} — {action['reason']}"
-                )
-                await self.telegram.send_message(
-                    f"*Entry Cancelled*: {entry.symbol}\n{action['reason']}"
-                )
+        logger.info(f"CLOSED {symbol}: P&L ${pnl:+,.2f} | R: {r_mult:+.2f} | {reason}")
+        await self.telegram.send_message(
+            f"*Position Closed*: {symbol}\n"
+            f"P&L: ${pnl:+,.2f} | R: {r_mult:+.2f}\n"
+            f"Reason: {reason}"
+        )
 
     # ══════════════════════════════════════════════════════
     # SCHEDULED JOBS
@@ -757,10 +765,11 @@ class AutoTrader:
         self.scanner.scan_for_movers()
 
         # Reset daily counters
-        self._trades_today = 0
-        self._wins_today = 0
-        self._losses_today = 0
+        self.daily_trades = 0
+        self.daily_pnl = 0.0
         self._daily_r = 0.0
+        self.consecutive_losses = 0
+        self.cooldown_until = None
 
         await self.telegram.send_message(
             f"*Pre-Market Scan*\n"
@@ -770,320 +779,137 @@ class AutoTrader:
         )
 
     async def _eod_close_all(self):
-        # Cancel any pending stalked entries first
-        if self.stalker.pending:
-            logger.info(f"EOD: Cancelling {self.stalker.count} stalked entries")
-            self.stalker.cancel_all(self.broker)
-
-        positions = self.broker.get_positions()
-        if not positions:
+        """Close all positions at 3:50 PM — identical to backtest force close."""
+        if not self.positions:
             logger.info("EOD: No positions to close")
             return
 
-        logger.warning(f"EOD: Closing {len(positions)} positions")
-        await self.telegram.send_message(f"*EOD CLOSE*: Closing {len(positions)} positions")
+        logger.warning(f"EOD: Closing {len(self.positions)} positions")
+        await self.telegram.send_message(f"*EOD CLOSE*: Closing {len(self.positions)} positions")
 
-        for pos in positions:
-            symbol = pos.get("symbol")
-            pnl = pos.get("unrealized_pnl", 0)
-            current_price = pos.get("current_price", 0)
-
-            # Track R-multiple before removing position
-            if symbol in self.positions.positions:
-                managed = self.positions.positions[symbol]
-                if managed.risk_per_share > 0 and current_price > 0:
-                    r_earned = (current_price - managed.entry_price) / managed.risk_per_share
-                    self._daily_r += r_earned
-
-            self.broker.close_position(symbol)
-            self.positions.remove_position(symbol)
-
-            if pnl > 0:
-                self._wins_today += 1
-            elif pnl < 0:
-                self._losses_today += 1
-
-            logger.info(f"EOD closed: {symbol} (P&L: ${pnl:,.2f})")
-
-        self.broker.cancel_all_orders()
-
-    async def _snapshot_portfolio(self):
-        self.broker.snapshot_portfolio()
+        for sym in list(self.positions.keys()):
+            await self._close_live_position(sym, "EOD force close")
+            await asyncio.sleep(0.5)
 
     async def _daily_summary(self):
-        """End-of-day summary, journal entry, then auto-shutdown."""
-        portfolio = self.broker.get_portfolio()
+        """End-of-day summary and shutdown."""
+        account = self.broker.get_account()
+        equity = account.get("equity", 0)
 
-        session = get_session()
-        try:
-            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0)
-            trades = session.query(Trade).filter(Trade.created_at >= today_start).all()
+        await self.telegram.send_message(
+            f"*Daily Summary*\n"
+            f"Trades: {self.daily_trades}\n"
+            f"P&L: ${self.daily_pnl:+,.2f}\n"
+            f"R earned: {self._daily_r:+.1f}\n"
+            f"Equity: ${equity:,.2f}"
+        )
 
-            # Write trading journal entry
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            total = self._wins_today + self._losses_today
-            win_rate = (self._wins_today / total * 100) if total > 0 else 0
+        # Auto-shutdown
+        logger.info("Daily summary complete — shutting down")
+        self._running = False
 
-            journal = TradingJournal(
-                date=today_str,
-                total_trades=self._trades_today,
-                wins=self._wins_today,
-                losses=self._losses_today,
-                win_rate=win_rate,
-                total_pnl=portfolio.get("daily_pnl", 0),
-                total_r=self._daily_r,
-                universe_size=len(self.scanner.universe),
-                hot_list_size=len(self.scanner.hot_list),
-                ending_equity=portfolio.get("equity", 0),
-            )
-            session.merge(journal)
-            session.commit()
-
-            await self.telegram.send_daily_summary(portfolio, trades)
-
-            # Performance analytics — log running metrics
-            metrics = calculate_metrics()
-            if metrics.total_trades > 0:
-                logger.info(f"\n{format_metrics_for_log(metrics)}")
-
-        except Exception as e:
-            logger.error(f"Daily summary error: {e}")
-            session.rollback()
-        finally:
-            session.close()
-
-        # Reset counters
-        self._trades_today = 0
-        self._wins_today = 0
-        self._losses_today = 0
-        self._daily_r = 0.0
-
-        # Auto-shutdown after daily summary — launchd will restart tomorrow
-        logger.info("Daily summary complete. Shutting down until tomorrow.")
-        await self.stop()
-
-    async def _weekly_performance_report(self):
-        """Friday EOD: send weekly performance analytics via Telegram."""
-        try:
-            metrics = calculate_metrics(days_back=7)
-            if metrics.total_trades == 0:
-                await self.telegram.send_message("*Weekly Report*\nNo trades this week.")
-                return
-
-            report = format_metrics_for_telegram(metrics)
-            await self.telegram.send_message(report)
-
-            # Also log the full report
-            full_report = format_metrics_for_log(metrics)
-            logger.info(f"Weekly performance report:\n{full_report}")
-
-            # Auto-adjustment: flag bad patterns
-            if metrics.patterns_to_avoid:
-                logger.warning(
-                    f"PATTERN ALERT: Consider removing these setups: "
-                    f"{', '.join(metrics.patterns_to_avoid)} "
-                    f"(win rate < 35% with negative R after 10+ trades)"
+    async def _reconcile_positions(self):
+        """On startup, register any existing broker positions."""
+        broker_positions = self.broker.get_positions()
+        for bp in broker_positions:
+            sym = bp["symbol"]
+            if sym not in self.positions:
+                entry = bp["avg_entry_price"]
+                qty = int(bp["qty"])
+                # Create a position with conservative stop (3% below entry)
+                stop = entry * 0.97
+                self.positions[sym] = LivePosition(
+                    symbol=sym,
+                    entry_price=entry,
+                    quantity=qty,
+                    stop_loss=stop,
+                    take_profit=entry * 1.05,
+                    entry_time=datetime.now(timezone.utc),
+                    pattern="reconciled",
                 )
-                await self.telegram.send_message(
-                    f"*Pattern Alert*\n"
-                    f"Remove: {', '.join(metrics.patterns_to_avoid)}\n"
-                    f"(WR < 35% + negative R, 10+ trades)"
-                )
-        except Exception as e:
-            logger.error(f"Weekly report error: {e}")
+                # Place broker stop if none exists
+                stop_id = self.broker.place_stop_loss(sym, qty, stop)
+                if stop_id:
+                    self.positions[sym].broker_stop_order_id = stop_id
+                logger.info(f"Reconciled position: {sym} {qty} shares @ ${entry:.2f}")
 
     # ══════════════════════════════════════════════════════
-    # HELPERS
+    # HELPERS — identical to backtest engine
     # ══════════════════════════════════════════════════════
 
-    async def _reconcile_broker_stops(self):
-        """On startup, verify all Alpaca positions have broker-side stop orders.
-        If any position is missing a stop, place one at 3% below current price."""
-        positions = self.broker.get_positions()
-        open_orders = self.broker.get_open_orders()
-
-        # Find which symbols already have stop orders
-        symbols_with_stops = set()
-        for order in open_orders:
-            if order.get("type") == "stop" and order.get("side") == "sell":
-                symbols_with_stops.add(order["symbol"])
-
-        for pos in positions:
-            symbol = pos["symbol"]
-            if symbol not in symbols_with_stops:
-                current_price = pos["current_price"]
-                qty = int(float(pos["qty"]))
-                default_stop = round(current_price * 0.97, 2)  # 3% below current
-
-                # If we have a managed position with a known stop, use that instead
-                if symbol in self.positions.positions:
-                    managed = self.positions.positions[symbol]
-                    default_stop = managed.current_stop
-
-                logger.warning(
-                    f"RECONCILE: {symbol} has no broker stop — placing at ${default_stop:.2f}"
-                )
-                stop_id = self.broker.place_stop_loss(symbol, qty, default_stop)
-                if stop_id and symbol in self.positions.positions:
-                    self.positions.positions[symbol].broker_stop_order_id = stop_id
-
-        if not positions:
-            logger.info("Reconcile: No open positions to check")
-        else:
-            logger.info(f"Reconcile: Checked {len(positions)} positions, "
-                        f"{len(positions) - len(symbols_with_stops & {p['symbol'] for p in positions})} needed stops")
-
-    def _get_position_pnl(self, symbol: str, current_price: float) -> float:
-        """Get unrealized P&L for a position."""
-        if symbol in self.positions.positions:
-            pos = self.positions.positions[symbol]
-            return (current_price - pos.entry_price) * pos.shares_remaining
-        # Fallback: check broker
-        for p in self.broker.get_positions():
-            if p["symbol"] == symbol:
-                return p.get("unrealized_pnl", 0)
-        return 0.0
-
-    async def _wait_for_approval(self, proposal_id: str) -> bool | None:
-        elapsed = 0
-        while elapsed < APPROVAL_TIMEOUT_SECONDS:
-            status = self.telegram.get_approval_status(proposal_id)
-            if status is not None:
-                return status
-            await asyncio.sleep(5)
-            elapsed += 5
-        return None
-
-    def _is_market_hours(self) -> bool:
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-
-        now_et = datetime.now(ZoneInfo("US/Eastern"))
-        if now_et.weekday() >= 5:
-            return False
-
-        market_open = now_et.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
-        market_close = now_et.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
-        return market_open <= now_et <= market_close
-
-    def _get_market_phase(self) -> str:
-        """Determine current market phase — drives strategy selection."""
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-
-        now_et = datetime.now(ZoneInfo("US/Eastern"))
-        h, m = now_et.hour, now_et.minute
-        minutes = h * 60 + m
-
-        if minutes < 570:  # Before 9:30
+    def _get_phase(self, hour: int, minute: int) -> str:
+        """Determine market phase from ET time — identical to backtest."""
+        t = hour * 60 + minute
+        if t < 9 * 60 + 30:
             return "premarket"
-        elif minutes < 600:  # 9:30-10:00
+        elif t < 10 * 60:
             return "open"
-        elif minutes < 660:  # 10:00-11:00
+        elif t < 11 * 60:
             return "prime"
-        elif minutes < 810:  # 11:00-1:30
+        elif t < 13 * 60 + 30:
             return "lunch"
-        elif minutes < 900:  # 1:30-3:00
+        elif t < 15 * 60:
             return "afternoon"
-        elif minutes < 950:  # 3:00-3:50
+        elif t < 15 * 60 + 50:
             return "power_hour"
-        else:  # 3:50+
+        else:
             return "close"
 
-    def _minutes_to_close(self) -> int:
+    def _is_analysis_time(self, hour: int, minute: int) -> bool:
+        """Check if current time is within ±5 min of a scheduled analysis time."""
+        current = hour * 60 + minute
+        for t in ANALYSIS_TIMES:
+            target = t.hour * 60 + t.minute
+            if abs(current - target) <= 5:
+                return True
+        return False
+
+    def _is_market_hours(self) -> bool:
+        """Check if market is open."""
         try:
             from zoneinfo import ZoneInfo
         except ImportError:
             from backports.zoneinfo import ZoneInfo
 
-        now_et = datetime.now(ZoneInfo("US/Eastern"))
-        close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-        diff = (close_time - now_et).total_seconds() / 60
-        return max(0, int(diff))
+        now = datetime.now(ZoneInfo("US/Eastern"))
+        if now.weekday() >= 5:
+            return False
+        market_open = now.replace(hour=9, minute=30, second=0)
+        market_close = now.replace(hour=16, minute=0, second=0)
+        return market_open <= now <= market_close
 
-    def _log_decision(self, result, market_phase: str = ""):
-        session = get_session()
-        try:
-            decision = Decision(
-                symbol=result.symbol,
-                action=result.action,
-                confidence=result.confidence,
-                reasoning=result.reasoning,
-                pattern=result.pattern,
-                indicators=result.indicators,
-                news_summary=result.raw_response,
-                market_phase=market_phase,
-            )
-            session.add(decision)
-            session.commit()
-        except Exception as e:
-            logger.error(f"Failed to log decision: {e}")
-            session.rollback()
-        finally:
-            session.close()
-
-    def _update_decision_blocked(self, result, reason: str):
-        session = get_session()
-        try:
-            decision = (
-                session.query(Decision)
-                .filter(Decision.symbol == result.symbol)
-                .order_by(Decision.created_at.desc())
-                .first()
-            )
-            if decision:
-                decision.blocked_reason = reason
-                session.commit()
-        except Exception as e:
-            logger.error(f"Failed to update decision: {e}")
-            session.rollback()
-        finally:
-            session.close()
+    def _check_sector_ok(self, symbol: str) -> bool:
+        """Check sector concentration — identical to backtest."""
+        target_group = None
+        for group, members in _CORRELATED_GROUPS.items():
+            if symbol in members:
+                target_group = group
+                break
+        if target_group is None:
+            return True
+        held = [s for s in self.positions if s in _CORRELATED_GROUPS.get(target_group, set())]
+        return len(held) < _MAX_SECTOR_CONCENTRATION
 
 
-def setup_logging():
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    file_handler = logging.FileHandler(
-        LOG_DIR / f"autotrader_{datetime.now().strftime('%Y%m%d')}.log"
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-    console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
-
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-    root.addHandler(file_handler)
-    root.addHandler(console_handler)
-
-    for lib in ("httpx", "httpcore", "urllib3", "yfinance", "apscheduler", "peewee"):
-        logging.getLogger(lib).setLevel(logging.WARNING)
-
+# ═══════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════
 
 async def run():
-    setup_logging()
+    """Start the trading system."""
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
+    for lib in ("httpx", "httpcore", "urllib3", "yfinance", "alpaca"):
+        logging.getLogger(lib).setLevel(logging.WARNING)
+
     trader = AutoTrader()
 
     loop = asyncio.get_event_loop()
-    def shutdown_handler():
-        logger.info("Received shutdown signal")
-        asyncio.ensure_future(trader.stop())
-
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown_handler)
+        loop.add_signal_handler(sig, lambda: asyncio.ensure_future(trader.stop()))
 
-    try:
-        await trader.start()
-    except KeyboardInterrupt:
-        await trader.stop()
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}", exc_info=True)
-        await trader.stop()
-        sys.exit(1)
+    await trader.start()

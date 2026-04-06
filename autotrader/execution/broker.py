@@ -1,4 +1,9 @@
-"""Alpaca broker integration for order execution."""
+"""Alpaca broker integration for order execution.
+
+Handles all interactions with the Alpaca brokerage API:
+market orders, limit orders, stop losses, position management.
+No database dependencies — logging only.
+"""
 
 import logging
 from datetime import datetime, timezone
@@ -10,14 +15,11 @@ from alpaca.trading.requests import (
     StopOrderRequest,
     StopLossRequest,
     TakeProfitRequest,
-    TrailingStopOrderRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, OrderStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 from alpaca.common.exceptions import APIError
 
 from autotrader.config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
-from autotrader.risk.manager import TradeProposal, RiskVerdict
-from autotrader.db.models import get_session, Trade, PortfolioSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -81,53 +83,21 @@ class AlpacaBroker:
         account["positions"] = positions
         return account
 
-    def execute_trade(self, proposal: TradeProposal, verdict: RiskVerdict) -> Trade | None:
-        """Execute a trade that has been approved by risk management.
-
-        Args:
-            proposal: The approved trade proposal
-            verdict: Risk verdict with adjusted quantity
-
-        Returns:
-            Trade record or None on failure
-        """
-        if not verdict.approved:
-            logger.warning(f"Attempted to execute unapproved trade: {verdict.reason}")
-            return None
-
-        quantity = verdict.adjusted_quantity
-        if quantity <= 0:
-            logger.warning(f"Cannot execute trade with quantity {quantity}")
-            return None
-
-        side = OrderSide.BUY if proposal.side == "BUY" else OrderSide.SELL
-
+    def buy_shares(self, symbol: str, quantity: int) -> str | None:
+        """Place a market buy order. Returns order_id or None."""
         try:
-            if proposal.side == "SELL":
-                # For sells, close the position (handles bracket order children)
-                self.cancel_orders_for_symbol(proposal.symbol)
-                order = self._place_market_order(proposal.symbol, quantity, side)
-            else:
-                # For buys, use simple market order — PositionManager handles stops/targets
-                # (Bracket orders lock shares and prevent future sells)
-                order = self._place_market_order(proposal.symbol, quantity, side)
-
-            if not order:
-                return None
-
-            # Log to database
-            trade = self._log_trade(proposal, verdict, order)
-            logger.info(
-                f"TRADE EXECUTED: {proposal.side} {quantity} {proposal.symbol} "
-                f"(order_id={order.id}, confidence={proposal.confidence:.0%})"
-            )
-            return trade
-
+            order = self._place_market_order(symbol, quantity, OrderSide.BUY)
+            if order:
+                logger.info(
+                    f"BUY MARKET: {quantity} {symbol} (order_id={order.id})"
+                )
+                return str(order.id)
+            return None
         except APIError as e:
-            logger.error(f"Alpaca API error executing trade: {e}")
+            logger.error(f"Failed to buy {quantity} {symbol}: {e}")
             return None
         except Exception as e:
-            logger.error(f"Error executing trade: {e}")
+            logger.error(f"Error buying {symbol}: {e}")
             return None
 
     def sell_shares(self, symbol: str, quantity: int) -> bool:
@@ -136,9 +106,7 @@ class AlpacaBroker:
         Cancels any pending orders for the symbol first to free held shares.
         """
         try:
-            # Cancel pending orders that may be holding shares (bracket children, stops, etc.)
             self.cancel_orders_for_symbol(symbol)
-
             request = MarketOrderRequest(
                 symbol=symbol,
                 qty=quantity,
@@ -155,9 +123,7 @@ class AlpacaBroker:
     def close_position(self, symbol: str) -> bool:
         """Close an entire position. Cancels pending orders first to free held shares."""
         try:
-            # Cancel any pending orders (bracket children, stops, etc.) that hold shares
             self.cancel_orders_for_symbol(symbol)
-
             self.client.close_position(symbol)
             logger.info(f"Position closed: {symbol}")
             return True
@@ -219,36 +185,6 @@ class AlpacaBroker:
             logger.error(f"Failed to cancel orders: {e}")
             return False
 
-    def snapshot_portfolio(self):
-        """Save a portfolio snapshot to the database."""
-        portfolio = self.get_portfolio()
-        if not portfolio:
-            return
-
-        session = get_session()
-        try:
-            snap = PortfolioSnapshot(
-                total_equity=portfolio.get("equity", 0),
-                cash=portfolio.get("cash", 0),
-                buying_power=portfolio.get("buying_power", 0),
-                positions=[
-                    {"symbol": p["symbol"], "qty": p["qty"],
-                     "market_value": p["market_value"], "pnl": p["unrealized_pnl"]}
-                    for p in portfolio.get("positions", [])
-                ],
-                daily_pnl=portfolio.get("daily_pnl", 0),
-                total_pnl=sum(
-                    p.get("unrealized_pnl", 0) for p in portfolio.get("positions", [])
-                ),
-            )
-            session.add(snap)
-            session.commit()
-        except Exception as e:
-            logger.error(f"Failed to snapshot portfolio: {e}")
-            session.rollback()
-        finally:
-            session.close()
-
     def place_limit_buy(self, symbol: str, quantity: int, limit_price: float) -> str | None:
         """Place a limit buy order. Returns order_id or None."""
         try:
@@ -296,22 +232,31 @@ class AlpacaBroker:
 
     def place_stop_loss(self, symbol: str, qty: int, stop_price: float) -> str | None:
         """Place a broker-side stop loss order. Returns order ID or None."""
-        order = self._place_stop_loss(symbol, qty, stop_price)
-        if order:
+        try:
+            request = StopOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                stop_price=round(stop_price, 2),
+            )
+            order = self.client.submit_order(request)
             logger.info(
                 f"BROKER STOP placed: {symbol} {qty} shares @ ${stop_price:.2f} "
                 f"(order_id={order.id})"
             )
             return str(order.id)
-        return None
+        except Exception as e:
+            logger.error(f"Failed to place stop loss for {symbol}: {e}")
+            return None
 
     def replace_stop_loss(self, old_order_id: str, symbol: str, qty: int, new_stop: float) -> str | None:
-        """Cancel old stop and place a new one at a different price/quantity. Returns new order ID."""
+        """Cancel old stop and place a new one at a different price/quantity."""
         if old_order_id:
             self.cancel_order(old_order_id)
         return self.place_stop_loss(symbol, qty, new_stop)
 
-    # ── Private methods ────────────────────────────────
+    # ��─ Private methods ────────────────────────────────
 
     def _place_market_order(self, symbol: str, qty: int, side: OrderSide):
         """Place a simple market order."""
@@ -322,60 +267,3 @@ class AlpacaBroker:
             time_in_force=TimeInForce.DAY,
         )
         return self.client.submit_order(request)
-
-    def _place_bracket_order(self, symbol: str, qty: int, side: OrderSide,
-                              stop_loss: float, take_profit: float):
-        """Place a bracket order (entry + stop loss + take profit)."""
-        request = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=side,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            stop_loss=StopLossRequest(stop_price=round(stop_loss, 2)),
-            take_profit=TakeProfitRequest(limit_price=round(take_profit, 2)),
-        )
-        return self.client.submit_order(request)
-
-    def _place_stop_loss(self, symbol: str, qty: int, stop_price: float):
-        """Place a standalone stop loss order."""
-        try:
-            request = StopOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                stop_price=round(stop_price, 2),
-            )
-            return self.client.submit_order(request)
-        except Exception as e:
-            logger.error(f"Failed to place stop loss for {symbol}: {e}")
-            return None
-
-    def _log_trade(self, proposal: TradeProposal, verdict: RiskVerdict, order) -> Trade:
-        """Log a trade to the database."""
-        session = get_session()
-        try:
-            trade = Trade(
-                symbol=proposal.symbol,
-                side=proposal.side,
-                quantity=verdict.adjusted_quantity,
-                order_type="market",
-                filled_price=float(order.filled_avg_price) if order.filled_avg_price else None,
-                status=order.status.value if hasattr(order.status, 'value') else str(order.status),
-                alpaca_order_id=str(order.id),
-                confidence=proposal.confidence,
-                reasoning=proposal.reasoning,
-                stop_loss=proposal.stop_loss,
-                take_profit=proposal.take_profit,
-            )
-            session.add(trade)
-            session.commit()
-            session.refresh(trade)
-            return trade
-        except Exception as e:
-            logger.error(f"Failed to log trade: {e}")
-            session.rollback()
-            return None
-        finally:
-            session.close()
