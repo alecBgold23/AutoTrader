@@ -277,6 +277,7 @@ class SimulatedPosition:
     entry_time: datetime
     pattern: str = ""
     confidence: float = 0.0
+    direction: str = "long"    # "long" or "short"
     risk_per_share: float = 0.0
     highest_price: float = 0.0
     lowest_price: float = 0.0
@@ -300,8 +301,13 @@ class SimulatedPosition:
         self.highest_price = self.entry_price
         self.lowest_price = self.entry_price
         self.shares_remaining = self.quantity
-        self.r_target_1 = self.entry_price + self.risk_per_share * 0.5  # Phase 6: 0.5R first target (was 1R)
-        self.r_target_2 = self.entry_price + self.risk_per_share * 1.5  # Phase 6: 1.5R second target (was 2R)
+        if self.direction == "short":
+            # Short targets are BELOW entry
+            self.r_target_1 = self.entry_price - self.risk_per_share * 0.5
+            self.r_target_2 = self.entry_price - self.risk_per_share * 1.5
+        else:
+            self.r_target_1 = self.entry_price + self.risk_per_share * 0.5
+            self.r_target_2 = self.entry_price + self.risk_per_share * 1.5
         self.current_stop = self.stop_loss
 
 
@@ -319,6 +325,7 @@ class BacktestTrade:
     exit_reason: str
     confidence: float = 0.0
     market_phase: str = ""
+    direction: str = "long"      # "long" or "short"
     slippage_cost: float = 0.0
     trading_costs: float = 0.0   # Phase 2: realistic round-trip costs
     mae: float = 0.0             # Phase 3: max adverse excursion %
@@ -434,10 +441,12 @@ class BacktestEngine:
         self.max_trades_per_day = max_trades_per_day
         self.deterministic = deterministic
 
-        # Initialize signal engine for deterministic mode
+        # Initialize signal engines for deterministic mode
         if self.deterministic:
             from autotrader.signals.engine import SignalEngine
+            from autotrader.signals.short_engine import ShortSignalEngine
             self.signal_engine = SignalEngine(params=signal_params)
+            self.short_engine = ShortSignalEngine(params=signal_params)
 
         self.positions: dict[str, SimulatedPosition] = {}
         self.completed_trades: list[BacktestTrade] = []
@@ -655,8 +664,8 @@ class BacktestEngine:
         # Determine which timestamps to run analysis cycles at
         analysis_indices = self._pick_analysis_bar_indices(sorted_times)
 
-        # Pending orders: {symbol: {side, qty, stop_loss, take_profit, pattern, confidence, reasoning}}
-        pending_buys: dict[str, dict] = {}
+        # Pending orders: {symbol: {direction, qty, stop_loss, take_profit, pattern, confidence, reasoning}}
+        pending_orders: dict[str, dict] = {}
 
         for bar_idx, current_time in enumerate(sorted_times):
             current_et = current_time
@@ -687,23 +696,29 @@ class BacktestEngine:
                 self._force_close_all(current_time, sym_day_bars, bar_idx, sorted_times)
                 break
 
-            # ── Fill pending buy orders at this bar's open ──
-            for sym in list(pending_buys.keys()):
+            # ── Fill pending orders at this bar's open ──
+            for sym in list(pending_orders.keys()):
                 if sym in sym_day_bars and sym not in self.positions:
                     today_df = sym_day_bars[sym]
                     if current_time in today_df.index:
                         bar = today_df.loc[current_time]
-                        fill_price = float(bar["Open"]) + SLIPPAGE_PER_SHARE
-                        order = pending_buys.pop(sym)
+                        order = pending_orders.pop(sym)
+                        direction = order.get("direction", "long")
 
-                        # Widen stop by 15% of risk distance — Claude's stops
-                        # can be too tight for 5-min bar noise
-                        risk_dist = abs(fill_price - order["stop_loss"])
-                        buffered_stop = order["stop_loss"] - risk_dist * 0.15
-
-                        # Verify stop still valid after slippage
-                        if fill_price <= buffered_stop:
-                            continue
+                        if direction == "short":
+                            # Short fill: sell at open - slippage
+                            fill_price = float(bar["Open"]) - SLIPPAGE_PER_SHARE
+                            risk_dist = abs(order["stop_loss"] - fill_price)
+                            buffered_stop = order["stop_loss"] + risk_dist * 0.15
+                            if fill_price >= buffered_stop:
+                                continue
+                        else:
+                            # Long fill: buy at open + slippage
+                            fill_price = float(bar["Open"]) + SLIPPAGE_PER_SHARE
+                            risk_dist = abs(fill_price - order["stop_loss"])
+                            buffered_stop = order["stop_loss"] - risk_dist * 0.15
+                            if fill_price <= buffered_stop:
+                                continue
 
                         self.positions[sym] = SimulatedPosition(
                             symbol=sym,
@@ -714,6 +729,7 @@ class BacktestEngine:
                             entry_time=current_time,
                             pattern=order["pattern"],
                             confidence=order["confidence"],
+                            direction=direction,
                         )
                         self.daily_trades += 1
 
@@ -758,7 +774,7 @@ class BacktestEngine:
                         break
                     if sym in self.positions:
                         continue  # Already in this stock
-                    if sym in pending_buys:
+                    if sym in pending_orders:
                         continue
                     if sym not in sym_day_bars:
                         continue
@@ -866,7 +882,7 @@ class BacktestEngine:
 
                     # ── Deterministic signal engine vs Claude ──
                     if self.deterministic:
-                        # Use deterministic signal engine (no API calls)
+                        # Try LONG signal first
                         sig_decision = self.signal_engine.score(
                             symbol=sym,
                             price_data=price_data,
@@ -878,8 +894,23 @@ class BacktestEngine:
                             regime=regime.get("label", "unknown"),
                         )
 
+                        # If no long signal, try SHORT
+                        trade_direction = "long"
                         if sig_decision.action != "BUY":
-                            continue
+                            short_decision = self.short_engine.score(
+                                symbol=sym,
+                                price_data=price_data,
+                                indicators=indicators,
+                                intraday_indicators=intraday_indicators,
+                                patterns_text=patterns_text,
+                                levels=key_levels,
+                                phase=phase,
+                                regime=regime.get("label", "unknown"),
+                            )
+                            if short_decision.action != "SHORT":
+                                continue
+                            sig_decision = short_decision
+                            trade_direction = "short"
 
                         action = sig_decision.action
                         confidence = sig_decision.confidence
@@ -945,6 +976,9 @@ class BacktestEngine:
                         phase_mult = 1.5
                     else:
                         phase_mult = max(phase_mult, 0.40)
+                    # Pattern-quality sizing: ORB patterns get full size, others get 50%
+                    # Data: ORB = +$3,845 from 203 trades, non-ORB = +$96 from 103 trades
+                    pattern_mult = 1.0 if pattern and "ORB" in pattern else 0.50
                     risk_amount = (
                         self.equity
                         * BACKTEST_RISK["max_risk_per_trade_pct"]
@@ -965,11 +999,13 @@ class BacktestEngine:
                     max_shares = int(self.equity * BACKTEST_RISK["max_position_pct"] / price)
                     max_by_cash = int(portfolio["cash"] / price)
                     shares = min(shares, max_shares, max_by_cash)
+                    # Apply pattern-quality sizing AFTER caps (otherwise cap overrides it)
+                    shares = max(1, int(shares * pattern_mult))
                     if shares <= 0:
                         continue
 
                     # Queue order to fill at next bar's open
-                    pending_buys[sym] = {
+                    pending_orders[sym] = {
                         "qty": shares,
                         "stop_loss": stop_loss,
                         "take_profit": take_profit,
@@ -977,6 +1013,7 @@ class BacktestEngine:
                         "confidence": confidence,
                         "reasoning": reasoning,
                         "phase": phase,
+                        "direction": trade_direction if self.deterministic else "long",
                     }
 
         # End of day: force close anything remaining
@@ -987,7 +1024,7 @@ class BacktestEngine:
     def _manage_positions_at_bar(
         self, current_time: datetime, sym_day_bars: dict, hour: int, minute: int
     ):
-        """Check stops, scale-outs, and hard 20-minute time stop for all positions."""
+        """Check stops, scale-outs, and time stops — direction-aware for long AND short."""
         for sym in list(self.positions.keys()):
             pos = self.positions[sym]
             if sym not in sym_day_bars:
@@ -1001,6 +1038,7 @@ class BacktestEngine:
             bar_low = float(bar["Low"])
             bar_high = float(bar["High"])
             bar_close = float(bar["Close"])
+            is_short = pos.direction == "short"
 
             # Update highest/lowest price
             if bar_high > pos.highest_price:
@@ -1008,10 +1046,14 @@ class BacktestEngine:
             if bar_low < pos.lowest_price:
                 pos.lowest_price = bar_low
 
-            # Phase 3: Track MAE/MFE
+            # Track MAE/MFE (direction-aware)
             if pos.entry_price > 0:
-                adverse = (pos.entry_price - bar_low) / pos.entry_price * 100
-                favorable = (bar_high - pos.entry_price) / pos.entry_price * 100
+                if is_short:
+                    adverse = (bar_high - pos.entry_price) / pos.entry_price * 100
+                    favorable = (pos.entry_price - bar_low) / pos.entry_price * 100
+                else:
+                    adverse = (pos.entry_price - bar_low) / pos.entry_price * 100
+                    favorable = (bar_high - pos.entry_price) / pos.entry_price * 100
                 if adverse > pos.mae:
                     pos.mae = adverse
                     pos.mae_time = current_time
@@ -1019,38 +1061,50 @@ class BacktestEngine:
                     pos.mfe = favorable
                     pos.mfe_time = current_time
 
-            # Check stop loss — require CLOSE below stop (not just wick)
-            # This filters out noise wicks that briefly touch stop then reverse
-            if bar_close <= pos.current_stop:
-                exit_price = pos.current_stop - SLIPPAGE_PER_SHARE
-                self._close_position(sym, exit_price, current_time, "Stop loss hit")
-                continue
+            # Check stop loss (direction-aware)
+            if is_short:
+                # Short: stop triggers when close goes ABOVE stop
+                if bar_close >= pos.current_stop:
+                    exit_price = pos.current_stop + SLIPPAGE_PER_SHARE
+                    self._close_position(sym, exit_price, current_time, "Stop loss hit")
+                    continue
+            else:
+                # Long: stop triggers when close goes BELOW stop
+                if bar_close <= pos.current_stop:
+                    exit_price = pos.current_stop - SLIPPAGE_PER_SHARE
+                    self._close_position(sym, exit_price, current_time, "Stop loss hit")
+                    continue
 
-            # Phase 6: Adaptive exit system based on MAE/MFE analysis
-            # Key insight: 45% of losers were profitable, only 2.7% reached 1R,
-            # 86% exited via 30-min time stop. Need earlier profit protection.
-            current_r = (bar_close - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+            # Current R (direction-aware)
+            if is_short:
+                current_r = (pos.entry_price - bar_close) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+            else:
+                current_r = (bar_close - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
             hold_minutes = (current_time - pos.entry_time).total_seconds() / 60
 
-            # 1. Breakeven lock: once trade reaches +0.3R, lock stop at breakeven
-            #    This protects the 45% of losers that were profitable at some point.
+            # 1. Breakeven lock at +0.3R
             if not pos.breakeven_locked and current_r >= 0.3:
-                pos.current_stop = max(pos.entry_price, pos.current_stop)
+                if is_short:
+                    pos.current_stop = min(pos.entry_price, pos.current_stop)
+                else:
+                    pos.current_stop = max(pos.entry_price, pos.current_stop)
                 pos.breakeven_locked = True
 
-            # 2. Scale out at 0.5R — sell 1/3 (was 1R sell 1/2)
-            #    Data shows only 2.7% of trades reach 1R, but many reach 0.5R
-            if (pos.scale_out_stage == 0
-                    and bar_high >= pos.r_target_1
-                    and pos.shares_remaining > 1):
-                sell_qty = max(1, int(pos.quantity / 3))  # 1/3 position
+            # 2. Scale out at 0.5R (direction-aware target check)
+            target_1_hit = (bar_low <= pos.r_target_1) if is_short else (bar_high >= pos.r_target_1)
+            if pos.scale_out_stage == 0 and target_1_hit and pos.shares_remaining > 1:
+                sell_qty = max(1, int(pos.quantity / 3))
                 actual_sell = min(sell_qty, pos.shares_remaining - 1)
                 if actual_sell > 0:
-                    exit_price = pos.r_target_1 - SLIPPAGE_PER_SHARE
+                    exit_price = pos.r_target_1 + (SLIPPAGE_PER_SHARE if is_short else -SLIPPAGE_PER_SHARE)
                     costs = CostModel.round_trip_cost(pos.entry_price, exit_price, actual_sell)
-                    pnl = (exit_price - pos.entry_price) * actual_sell - costs
+                    if is_short:
+                        pnl = (pos.entry_price - exit_price) * actual_sell - costs
+                        r_mult = (pos.entry_price - exit_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+                    else:
+                        pnl = (exit_price - pos.entry_price) * actual_sell - costs
+                        r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
                     slippage = SLIPPAGE_PER_SHARE * 2 * actual_sell
-                    r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
 
                     self.completed_trades.append(BacktestTrade(
                         symbol=sym, pattern=pos.pattern,
@@ -1058,29 +1112,33 @@ class BacktestEngine:
                         quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
                         entry_time=pos.entry_time, exit_time=current_time,
                         exit_reason="Scale out 0.5R (1/3)",
-                        confidence=pos.confidence, slippage_cost=slippage,
-                        trading_costs=costs, mae=pos.mae, mfe=pos.mfe,
+                        confidence=pos.confidence, direction=pos.direction,
+                        slippage_cost=slippage, trading_costs=costs,
+                        mae=pos.mae, mfe=pos.mfe,
                     ))
                     self.equity += pnl
                     self.daily_pnl += pnl
                     pos.shares_remaining -= actual_sell
                     pos.realized_pnl += pnl
                     pos.scale_out_stage = 1
-                    pos.current_stop = pos.entry_price  # Move to breakeven
+                    pos.current_stop = pos.entry_price
                     pos.breakeven_locked = True
 
-            # 3. Scale out at 1.5R — sell another 1/3 (remainder trails)
-            if (pos.scale_out_stage == 1
-                    and bar_high >= pos.r_target_2
-                    and pos.shares_remaining > 1):
+            # 3. Scale out at 1.5R
+            target_2_hit = (bar_low <= pos.r_target_2) if is_short else (bar_high >= pos.r_target_2)
+            if pos.scale_out_stage == 1 and target_2_hit and pos.shares_remaining > 1:
                 sell_qty = max(1, int(pos.quantity / 3))
                 actual_sell = min(sell_qty, pos.shares_remaining - 1)
                 if actual_sell > 0:
-                    exit_price = pos.r_target_2 - SLIPPAGE_PER_SHARE
+                    exit_price = pos.r_target_2 + (SLIPPAGE_PER_SHARE if is_short else -SLIPPAGE_PER_SHARE)
                     costs = CostModel.round_trip_cost(pos.entry_price, exit_price, actual_sell)
-                    pnl = (exit_price - pos.entry_price) * actual_sell - costs
+                    if is_short:
+                        pnl = (pos.entry_price - exit_price) * actual_sell - costs
+                        r_mult = (pos.entry_price - exit_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+                    else:
+                        pnl = (exit_price - pos.entry_price) * actual_sell - costs
+                        r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
                     slippage = SLIPPAGE_PER_SHARE * 2 * actual_sell
-                    r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
 
                     self.completed_trades.append(BacktestTrade(
                         symbol=sym, pattern=pos.pattern,
@@ -1088,8 +1146,9 @@ class BacktestEngine:
                         quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
                         entry_time=pos.entry_time, exit_time=current_time,
                         exit_reason="Scale out 1.5R (1/3)",
-                        confidence=pos.confidence, slippage_cost=slippage,
-                        trading_costs=costs, mae=pos.mae, mfe=pos.mfe,
+                        confidence=pos.confidence, direction=pos.direction,
+                        slippage_cost=slippage, trading_costs=costs,
+                        mae=pos.mae, mfe=pos.mfe,
                     ))
                     self.equity += pnl
                     self.daily_pnl += pnl
@@ -1097,26 +1156,30 @@ class BacktestEngine:
                     pos.realized_pnl += pnl
                     pos.scale_out_stage = 2
 
-            # 4. Graduated time management (was hard 30-min close)
-            #    - 20 min: if profitable, trail tight; if losing, close
-            #    - 45 min: hard close regardless (was 30 min)
+            # 4. Time stops
             if hold_minutes >= 45:
-                exit_price = bar_close - SLIPPAGE_PER_SHARE
+                exit_price = bar_close + (SLIPPAGE_PER_SHARE if is_short else -SLIPPAGE_PER_SHARE)
                 self._close_position(sym, exit_price, current_time, "Time stop (45min)")
                 continue
             elif hold_minutes >= 20 and current_r <= 0:
-                # Losing after 20 min — thesis is dead, cut early
-                exit_price = bar_close - SLIPPAGE_PER_SHARE
+                # Showed some promise but back underwater — cut at 20min
+                exit_price = bar_close + (SLIPPAGE_PER_SHARE if is_short else -SLIPPAGE_PER_SHARE)
                 self._close_position(sym, exit_price, current_time, "Time stop (20min loser)")
                 continue
 
-            # 5. Trailing stop: trail at 0.5R from high once profitable, floor at breakeven
+            # 5. Trailing stop (direction-aware)
             if pos.breakeven_locked:
                 trail_distance = 0.5 * pos.risk_per_share
-                trail_stop = pos.highest_price - trail_distance
-                trail_stop = max(trail_stop, pos.entry_price)  # Floor at breakeven
-                if trail_stop > pos.current_stop:
-                    pos.current_stop = trail_stop
+                if is_short:
+                    trail_stop = pos.lowest_price + trail_distance
+                    trail_stop = min(trail_stop, pos.entry_price)
+                    if trail_stop < pos.current_stop:
+                        pos.current_stop = trail_stop
+                else:
+                    trail_stop = pos.highest_price - trail_distance
+                    trail_stop = max(trail_stop, pos.entry_price)
+                    if trail_stop > pos.current_stop:
+                        pos.current_stop = trail_stop
 
     def _force_close_all(self, close_time, sym_day_bars, bar_idx, sorted_times):
         """Force close all positions at EOD."""
@@ -1127,7 +1190,13 @@ class BacktestEngine:
                 # Use the last available bar's close
                 visible = today_df[today_df.index <= close_time]
                 if not visible.empty:
-                    exit_price = float(visible.iloc[-1]["Close"]) - SLIPPAGE_PER_SHARE
+                    raw_close = float(visible.iloc[-1]["Close"])
+                    # Shorts buy back (slippage hurts = higher price)
+                    # Longs sell (slippage hurts = lower price)
+                    if pos.direction == "short":
+                        exit_price = raw_close + SLIPPAGE_PER_SHARE
+                    else:
+                        exit_price = raw_close - SLIPPAGE_PER_SHARE
                 else:
                     exit_price = pos.entry_price  # Fallback
             else:
@@ -1146,11 +1215,15 @@ class BacktestEngine:
             del self.positions[symbol]
             return
 
-        # Phase 2: Realistic cost modeling
+        # Phase 2: Realistic cost modeling — direction-aware P&L
         costs = CostModel.round_trip_cost(pos.entry_price, exit_price, qty)
-        pnl = (exit_price - pos.entry_price) * qty - costs
+        if pos.direction == "short":
+            pnl = (pos.entry_price - exit_price) * qty - costs
+            r_mult = (pos.entry_price - exit_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
+        else:
+            pnl = (exit_price - pos.entry_price) * qty - costs
+            r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
         slippage = SLIPPAGE_PER_SHARE * 2 * qty  # Legacy tracking
-        r_mult = (exit_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
 
         self.completed_trades.append(BacktestTrade(
             symbol=symbol, pattern=pos.pattern,
@@ -1158,7 +1231,8 @@ class BacktestEngine:
             quantity=qty, pnl=pnl, r_multiple=r_mult,
             entry_time=pos.entry_time, exit_time=exit_time,
             exit_reason=reason,
-            confidence=pos.confidence, slippage_cost=slippage,
+            confidence=pos.confidence, direction=pos.direction,
+            slippage_cost=slippage,
             trading_costs=costs,
             mae=pos.mae, mfe=pos.mfe,
         ))
@@ -1654,9 +1728,7 @@ JSON only:
             except Exception:
                 continue
 
-            if len(universe) >= 800:
-                break
-
+            # No cap — scan the full market, just like live
             if (i // batch_size) % 5 == 0 and i > 0:
                 logger.info(f"  Scanned {i}/{len(symbols)} symbols, {len(universe)} qualify so far...")
 
@@ -2012,6 +2084,25 @@ def format_backtest_result(result: BacktestResult) -> str:
                 f"Avg R: {avg_r:+.2f} | P&L: ${s['pnl']:>9,.2f}"
             )
 
+    # Direction breakdown (long vs short)
+    long_trades = [t for t in result.trades if t.direction == "long"]
+    short_trades = [t for t in result.trades if t.direction == "short"]
+    if short_trades:  # Only show if there are shorts
+        lines.append("")
+        lines.append("─── DIRECTION BREAKDOWN ───")
+        for label, trades in [("Long", long_trades), ("Short", short_trades)]:
+            if not trades:
+                continue
+            tw = sum(1 for t in trades if t.pnl > 0)
+            wr = tw / len(trades) * 100
+            tpnl = sum(t.pnl for t in trades)
+            tr = sum(t.r_multiple for t in trades)
+            avg_r = tr / len(trades)
+            lines.append(
+                f"  {label:6s} {len(trades):3d} trades | WR: {wr:5.1f}% | "
+                f"Avg R: {avg_r:+.2f} | P&L: ${tpnl:>9,.2f}"
+            )
+
     # Phase 3: MAE/MFE Analysis
     if result.trades:
         winners = [t for t in result.trades if t.pnl > 0]
@@ -2023,7 +2114,10 @@ def format_backtest_result(result: BacktestResult) -> str:
         if winners:
             avg_winner_mae = np.mean([t.mae for t in winners])
             avg_winner_mfe = np.mean([t.mfe for t in winners])
-            avg_winner_return = np.mean([(t.exit_price - t.entry_price) / t.entry_price * 100 for t in winners if t.entry_price > 0])
+            avg_winner_return = np.mean([
+                ((t.entry_price - t.exit_price) if t.direction == "short" else (t.exit_price - t.entry_price))
+                / t.entry_price * 100 for t in winners if t.entry_price > 0
+            ])
             lines.append(f"  Winners avg MAE: {avg_winner_mae:.2f}% (noise before profit)")
             lines.append(f"  Winners avg MFE: {avg_winner_mfe:.2f}% (max potential)")
             lines.append(f"  Winners left on table: {avg_winner_mfe - avg_winner_return:.2f}%")

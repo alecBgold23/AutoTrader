@@ -405,7 +405,7 @@ Claude sees "{trades_today}/8 trades used" and is taught to pace itself.
 - **Jan-Mar 2024 backtest broken** — 5m bar data was re-downloaded, changing price/volume values, which invalidated all Claude cache keys for that period. Requires fresh API credits to re-cache.
 - **launchd import error** — `alpaca.data.news.NewsClient` module not found on launchd restart. The Friday process (manual `run.py`) works fine. Need to fix the launchd plist Python/venv path.
 - **Telegram** not configured — alerts are silently skipped
-- **No shorting** — System is long-only. SELL signals on unowned stocks are skipped.
+- **Shorting in backtest only** — `ShortSignalEngine` (`signals/short_engine.py`) integrated into `backtest/engine.py` with direction-aware P&L, stops, scale-outs. Patterns: Bear Flag (77% WR), ORB Breakdown (70% WR). Gap & Fade blocked. Live trading (`main.py`, `broker.py`) is still long-only — needs sync.
 - **Scanner uses yfinance batch downloads** — Can be slow on initial universe build (~2-3 min for 800 stocks)
 - **Backtest results not reproducible across sessions** — yfinance adjusts historical prices over time. Daily data cached on different dates produces different scanner scores and symbol selection.
 

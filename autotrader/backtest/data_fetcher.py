@@ -25,6 +25,40 @@ def _read_cached_csv(path: Path) -> pd.DataFrame:
     return df
 
 
+def _find_cached_file(symbol: str, start_date: str, end_date: str, interval: str = "1d") -> Path | None:
+    """Find any cached file for this symbol that covers the requested date range.
+
+    Looks for exact match first, then searches for files whose cached range
+    contains the requested range. Returns the best match (smallest covering range).
+    """
+    # Exact match first
+    exact = CACHE_DIR / f"{symbol}_{start_date.replace('-', '')}_{end_date.replace('-', '')}_{interval}.csv"
+    if exact.exists():
+        return exact
+
+    # Search for any file that covers the requested range
+    import re
+    pattern = re.compile(rf"^{re.escape(symbol)}_(\d{{8}})_(\d{{8}})_{re.escape(interval)}\.csv$")
+    req_start = int(start_date.replace("-", ""))
+    req_end = int(end_date.replace("-", ""))
+
+    best = None
+    best_span = float("inf")
+    for f in CACHE_DIR.iterdir():
+        m = pattern.match(f.name)
+        if not m:
+            continue
+        cached_start = int(m.group(1))
+        cached_end = int(m.group(2))
+        # Cached range must contain the requested range (with some tolerance for daily data)
+        if cached_start <= req_start and cached_end >= req_end:
+            span = cached_end - cached_start
+            if span < best_span:
+                best = f
+                best_span = span
+    return best
+
+
 def _get_alpaca_data_client():
     from alpaca.data.historical import StockHistoricalDataClient
     return StockHistoricalDataClient(
@@ -53,14 +87,17 @@ def fetch_5m_bars(
     """
     cache_file = _cache_path(symbol, start_date, end_date)
 
-    if cache_file.exists() and not force_refresh:
-        try:
-            df = _read_cached_csv(cache_file)
-            if not df.empty:
-                logger.debug(f"Cache hit: {symbol} {start_date} to {end_date} ({len(df)} bars)")
-                return df
-        except Exception:
-            pass  # Re-download if cache is corrupt
+    if not force_refresh:
+        # Try exact match first, then fuzzy search
+        cached = _find_cached_file(symbol, start_date, end_date, "5m") if not cache_file.exists() else cache_file
+        if cached and cached.exists():
+            try:
+                df = _read_cached_csv(cached)
+                if not df.empty:
+                    logger.debug(f"Cache hit: {symbol} {start_date} to {end_date} ({len(df)} bars)")
+                    return df
+            except Exception:
+                pass  # Re-download if cache is corrupt
 
     # Download from Alpaca in 30-day chunks
     from alpaca.data.requests import StockBarsRequest
@@ -143,12 +180,13 @@ def fetch_daily_bars(symbol: str, start_date: str, end_date: str) -> pd.DataFram
     """Fetch daily bars for indicator calculation (needs 3mo lookback before start).
 
     Uses yfinance for simplicity (free, reliable for daily data).
+    Searches cache fuzzy — any cached file covering the requested range works.
     """
-    cache_file = CACHE_DIR / f"{symbol}_{start_date.replace('-', '')}_{end_date.replace('-', '')}_1d.csv"
-
-    if cache_file.exists():
+    # Fuzzy cache lookup — finds any file covering the requested range
+    cached = _find_cached_file(symbol, start_date, end_date, "1d")
+    if cached:
         try:
-            df = _read_cached_csv(cache_file)
+            df = _read_cached_csv(cached)
             if not df.empty:
                 return df
         except Exception:
@@ -187,12 +225,12 @@ def fetch_daily_bars_batch(symbols: list[str], start_date: str, end_date: str) -
     result = {}
     uncached = []
 
-    # Check cache first
+    # Check cache first (fuzzy — any file covering the range works)
     for sym in symbols:
-        cache_file = CACHE_DIR / f"{sym}_{start_date.replace('-', '')}_{end_date.replace('-', '')}_1d.csv"
-        if cache_file.exists():
+        cached = _find_cached_file(sym, start_date, end_date, "1d")
+        if cached:
             try:
-                df = _read_cached_csv(cache_file)
+                df = _read_cached_csv(cached)
                 if not df.empty:
                     result[sym] = df
                     continue
@@ -284,10 +322,11 @@ def fetch_spy_daily(start_date: str, end_date: str) -> pd.DataFrame:
 def fetch_vix_daily(start_date: str, end_date: str) -> pd.DataFrame:
     """Fetch VIX daily data for regime detection."""
     import yfinance as yf
-    cache_file = CACHE_DIR / f"VIX_{start_date.replace('-', '')}_{end_date.replace('-', '')}_1d.csv"
-    if cache_file.exists():
+    # Fuzzy cache lookup
+    cached = _find_cached_file("VIX", start_date, end_date, "1d")
+    if cached:
         try:
-            return _read_cached_csv(cache_file)
+            return _read_cached_csv(cached)
         except Exception:
             pass
 
