@@ -65,8 +65,8 @@ DEFAULT_ANALYSIS_TIMES = [
 
 # Backtest-specific risk parameters (more aggressive than live for discovery)
 BACKTEST_RISK = {
-    "max_risk_per_trade_pct": 0.15,       # 15% max ($15k on $100k) — day trading, flat by EOD
-    "max_position_pct": 0.20,             # 20% max in one stock
+    "max_risk_per_trade_pct": 0.50,       # 50% max ($50k on $100k) — day trading, flat by EOD
+    "max_position_pct": 0.50,             # 50% max in one stock
     "max_total_exposure_pct": 0.80,       # 80% deployed at once
     "max_trades_per_day": 25,             # Room for 20+ trades
     "min_risk_reward_ratio": 1.5,         # Slightly relaxed from 2:1

@@ -72,8 +72,8 @@ MARKET_CLOSE_MINUTE = 0
 # SYNCED WITH BACKTEST — identical parameters for live and backtest
 RISK = {
     # Position sizing — matches backtest BACKTEST_RISK exactly
-    "max_risk_per_trade_pct": 0.15,      # 15% max ($15k on $100k) — day trading, flat by EOD
-    "max_position_pct": 0.20,            # 20% max in one stock
+    "max_risk_per_trade_pct": 0.50,      # 15% max ($15k on $100k) — day trading, flat by EOD
+    "max_position_pct": 0.50,            # 20% max in one stock
     "max_total_exposure_pct": 0.80,      # 80% deployed at once
 
     # Loss limits

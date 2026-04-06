@@ -45,8 +45,8 @@ SLIPPAGE_PER_SHARE = 0.01
 # ═══════════════════════════════════════════════════════════
 
 LIVE_RISK = {
-    "max_risk_per_trade_pct": 0.15,
-    "max_position_pct": 0.20,
+    "max_risk_per_trade_pct": 0.50,
+    "max_position_pct": 0.50,
     "max_total_exposure_pct": 0.80,
     "max_trades_per_day": 25,
     "min_risk_reward_ratio": 1.5,
