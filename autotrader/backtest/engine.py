@@ -1082,8 +1082,8 @@ class BacktestEngine:
                 current_r = (bar_close - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
             hold_minutes = (current_time - pos.entry_time).total_seconds() / 60
 
-            # 1. Breakeven lock at +0.3R
-            if not pos.breakeven_locked and current_r >= 0.3:
+            # 1. Breakeven lock at +0.4R
+            if not pos.breakeven_locked and current_r >= 0.4:
                 if is_short:
                     pos.current_stop = min(pos.entry_price, pos.current_stop)
                 else:

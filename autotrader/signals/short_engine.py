@@ -57,7 +57,7 @@ class ShortSignalEngine:
 
     # Thresholds
     MIN_SCORE_TO_TRADE = 62
-    MIN_CONFIDENCE = 0.72
+    MIN_CONFIDENCE = 0.70
     MIN_RVOL = 1.3
     MIN_RR_RATIO = 2.0
     MIN_CONFLUENCE = 3       # Minimum bearish factors (out of 5)
@@ -409,6 +409,10 @@ class ShortSignalEngine:
                 score += 35
                 if setup == ShortSetupType.NO_SETUP:
                     setup = ShortSetupType.ORB_BREAKDOWN
+                # Volume confirmation bonus (additive, not a gate)
+                vol_acc = intra.get("volume_acceleration")
+                if vol_acc is not None and vol_acc >= 1.5:
+                    score += 5
             else:
                 score += 10
 
@@ -439,7 +443,7 @@ class ShortSignalEngine:
                 setup = ShortSetupType.LOD_BREAK
 
         # ── Pattern text — bearish patterns are GOOD for shorts ──
-        if "bear_flag" in patterns_text.lower() or "BEAR" in patterns_text:
+        if "bear_flag" in patterns_text.lower():
             score += 15
             if setup == ShortSetupType.NO_SETUP:
                 setup = ShortSetupType.BEAR_FLAG
@@ -463,9 +467,10 @@ class ShortSignalEngine:
         ema_bearish = intra.get("ema_bullish_5m") is False
         below_vwap = intra.get("above_vwap_5m") is False
         if ema_bearish and below_vwap and gap_pct < -1.0:
-            score += 15
             if setup == ShortSetupType.NO_SETUP:
-                setup = ShortSetupType.MOMENTUM_BREAKDOWN
+                pass  # Blocked as standalone — weak signal
+            else:
+                score += 15  # Strong as confirmation
 
         return max(0, min(100, score)), setup
 
@@ -490,7 +495,10 @@ class ShortSignalEngine:
                 if bb_pct > 0.8:
                     score += 12  # Near upper BB = extended
                 elif bb_pct < 0.2:
-                    score -= 8   # Near lower BB = already oversold
+                    # Don't penalize ORB breakdowns for being near lower BB
+                    or_low = levels.get("or_low")
+                    if not (or_low and price < or_low):
+                        score -= 8   # Near lower BB = already oversold
 
         # Resistance proximity — being rejected from resistance is good for shorts
         resistance_levels = levels.get("resistance_levels", [])

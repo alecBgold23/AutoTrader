@@ -58,7 +58,7 @@ class SignalEngine:
 
     # Thresholds
     MIN_SCORE_TO_TRADE = 62  # Technical score gate (first filter)
-    MIN_CONFIDENCE = 0.72    # Comprehensive confidence gate (final filter)
+    MIN_CONFIDENCE = 0.70    # Comprehensive confidence gate (final filter)
     MIN_RVOL = 1.3           # Minimum relative volume
     MIN_RR_RATIO = 2.0       # Minimum reward:risk
     MIN_CONFLUENCE = 3       # Minimum bullish factors (out of 5)
@@ -452,6 +452,10 @@ class SignalEngine:
             if extension_pct <= 2.0:
                 score += 35
                 setup = SetupType.ORB_BREAKOUT
+                # Volume confirmation bonus (additive, not a gate)
+                vol_acc = intra.get("volume_acceleration")
+                if vol_acc is not None and vol_acc >= 1.5:
+                    score += 5
             else:
                 score += 10  # Extended breakout, lower conviction
 
@@ -494,7 +498,7 @@ class SignalEngine:
                 setup = SetupType.HOD_BREAK
 
         # ── Pattern text bonuses ──
-        if "bull_flag" in patterns_text.lower() or "BULL" in patterns_text:
+        if "bull_flag" in patterns_text.lower():
             score += 15
             if setup == SetupType.NO_SETUP:
                 setup = SetupType.BULL_FLAG
@@ -513,12 +517,14 @@ class SignalEngine:
             score -= 12
 
         # ── Momentum continuation ──
+        # Data: 29.2% WR, -$834 when used as primary setup. Strong as confirmation.
         ema_bull = intra.get("ema_bullish_5m")
         above_vwap = intra.get("above_vwap_5m")
         if ema_bull and above_vwap and gap_pct > 1.0:
-            score += 15
             if setup == SetupType.NO_SETUP:
-                setup = SetupType.MOMENTUM_CONTINUATION
+                pass  # Blocked as standalone — 25% WR, -$997 across 4 periods
+            else:
+                score += 15  # Strong as confirmation of existing pattern
 
         return max(0, min(100, score)), setup
 
@@ -543,7 +549,10 @@ class SignalEngine:
                 if bb_pct < 0.2:
                     score += 12
                 elif bb_pct > 0.8:
-                    score -= 8
+                    # Don't penalize breakouts for being near upper BB — that's expected
+                    or_high = levels.get("or_high")
+                    if not (or_high and price > or_high):
+                        score -= 8
 
         # Support proximity
         support_levels = levels.get("support_levels", [])
