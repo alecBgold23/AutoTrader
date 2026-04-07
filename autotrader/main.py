@@ -45,8 +45,8 @@ SLIPPAGE_PER_SHARE = 0.01
 # ═══════════════════════════════════════════════════════════
 
 LIVE_RISK = {
-    "max_risk_per_trade_pct": 0.50,
-    "max_position_pct": 0.50,
+    "max_risk_per_trade_pct": 0.05,
+    "max_position_pct": 0.15,
     "max_total_exposure_pct": 0.80,
     "max_trades_per_day": 25,
     "min_risk_reward_ratio": 1.5,
@@ -132,11 +132,11 @@ class LivePosition:
         self.lowest_price = self.entry_price
         self.shares_remaining = self.quantity
         if self.direction == "short":
-            self.r_target_1 = self.entry_price - self.risk_per_share * 0.5   # 0.5R below for shorts
-            self.r_target_2 = self.entry_price - self.risk_per_share * 1.5   # 1.5R below for shorts
+            self.r_target_1 = self.entry_price - self.risk_per_share * 1.0   # 1.0R below for shorts
+            self.r_target_2 = self.entry_price - self.risk_per_share * 2.0   # 2.0R below for shorts
         else:
-            self.r_target_1 = self.entry_price + self.risk_per_share * 0.5   # 0.5R first target
-            self.r_target_2 = self.entry_price + self.risk_per_share * 1.5   # 1.5R second target
+            self.r_target_1 = self.entry_price + self.risk_per_share * 1.0   # 1.0R first target
+            self.r_target_2 = self.entry_price + self.risk_per_share * 2.0   # 2.0R second target
         self.current_stop = self.stop_loss
 
 
@@ -522,6 +522,11 @@ class AutoTrader:
         if confidence < LIVE_RISK["min_confidence_to_trade"]:
             return
 
+        # Require a detected pattern — block NO_SETUP trades
+        pattern_name = decision.pattern if hasattr(decision, 'pattern') else ""
+        if not pattern_name or pattern_name.lower() in ("unknown", "no setup", "no_setup", "none", ""):
+            return
+
         # R:R check with slippage — identical to backtest
         risk = abs(price - stop_loss) + SLIPPAGE_PER_SHARE * 2
         reward = abs(take_profit - price) - SLIPPAGE_PER_SHARE * 2
@@ -536,9 +541,13 @@ class AutoTrader:
         else:
             phase_mult = max(phase_mult, 0.40)
 
-        # Pattern-quality sizing: ORB patterns get full size, others get 50%
+        # All patterns get equal sizing — no backtest-mined bias
         pattern = decision.pattern if hasattr(decision, 'pattern') else ""
-        pattern_mult = 1.0 if pattern and "ORB" in pattern else 0.50
+        pattern_mult = 1.0
+
+        # Confidence death zone 0.80-0.84: reduce size by 50%
+        if 0.80 <= confidence < 0.85:
+            pattern_mult *= 0.50
 
         risk_amount = (
             equity
@@ -667,8 +676,8 @@ class AutoTrader:
                     current_r = (current_price - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
                 hold_minutes = (now - pos.entry_time).total_seconds() / 60
 
-                # 1. Breakeven lock at +0.4R — identical to backtest
-                if not pos.breakeven_locked and current_r >= 0.4:
+                # 1. Breakeven lock at +1.0R — identical to backtest
+                if not pos.breakeven_locked and current_r >= 1.0:
                     if is_short:
                         new_stop = min(pos.entry_price, pos.current_stop)
                         improved = new_stop < pos.current_stop
@@ -688,7 +697,7 @@ class AutoTrader:
                             pos.broker_stop_order_id = new_id or ""
                         logger.info(f"BREAKEVEN LOCK: {sym} ({side_label}) stop → ${pos.current_stop:.2f}")
 
-                # 2. Scale out at 0.5R — direction-aware
+                # 2. Scale out at 1.0R — direction-aware
                 target_1_hit = (current_price <= pos.r_target_1) if is_short else (current_price >= pos.r_target_1)
                 if (pos.scale_out_stage == 0
                         and target_1_hit
@@ -719,15 +728,15 @@ class AutoTrader:
                                 )
                                 pos.broker_stop_order_id = new_id or ""
                             logger.info(
-                                f"SCALE OUT 0.5R: {sym} ({side_label}) {actual_sell} shares @ ${current_price:.2f} "
+                                f"SCALE OUT 1.0R: {sym} ({side_label}) {actual_sell} shares @ ${current_price:.2f} "
                                 f"(+${pnl:.2f})"
                             )
                             await self.telegram.send_message(
-                                f"*Scale Out 0.5R*: {sym} ({side_label}) | {actual_sell} shares @ ${current_price:.2f}\n"
+                                f"*Scale Out 1.0R*: {sym} ({side_label}) | {actual_sell} shares @ ${current_price:.2f}\n"
                                 f"P&L: ${pnl:+.2f} | Remaining: {pos.shares_remaining}"
                             )
 
-                # 3. Scale out at 1.5R — direction-aware
+                # 3. Scale out at 2.0R — direction-aware
                 target_2_hit = (current_price <= pos.r_target_2) if is_short else (current_price >= pos.r_target_2)
                 if (pos.scale_out_stage == 1
                         and target_2_hit
@@ -756,27 +765,27 @@ class AutoTrader:
                                 )
                                 pos.broker_stop_order_id = new_id or ""
                             logger.info(
-                                f"SCALE OUT 1.5R: {sym} ({side_label}) {actual_sell} shares @ ${current_price:.2f} "
+                                f"SCALE OUT 2.0R: {sym} ({side_label}) {actual_sell} shares @ ${current_price:.2f} "
                                 f"(+${pnl:.2f})"
                             )
                             await self.telegram.send_message(
-                                f"*Scale Out 1.5R*: {sym} ({side_label}) | {actual_sell} shares @ ${current_price:.2f}\n"
+                                f"*Scale Out 2.0R*: {sym} ({side_label}) | {actual_sell} shares @ ${current_price:.2f}\n"
                                 f"P&L: ${pnl:+.2f} | Remaining: {pos.shares_remaining}"
                             )
 
                 # 4. Time management — identical to backtest
-                if hold_minutes >= 45:
-                    logger.info(f"TIME STOP 45min: {sym} ({side_label})")
-                    await self._close_live_position(sym, "Time stop (45min)")
+                if hold_minutes >= 90:
+                    logger.info(f"TIME STOP 90min: {sym} ({side_label})")
+                    await self._close_live_position(sym, "Time stop (90min)")
                     continue
-                elif hold_minutes >= 20 and current_r <= 0:
-                    logger.info(f"TIME STOP 20min loser: {sym} ({side_label})")
-                    await self._close_live_position(sym, "Time stop (20min loser)")
+                elif hold_minutes >= 45 and current_r <= 0:
+                    logger.info(f"TIME STOP 45min loser: {sym} ({side_label})")
+                    await self._close_live_position(sym, "Time stop (45min loser)")
                     continue
 
                 # 5. Trailing stop — direction-aware (identical to backtest)
                 if pos.breakeven_locked:
-                    trail_distance = 0.5 * pos.risk_per_share
+                    trail_distance = 1.0 * pos.risk_per_share
                     if is_short:
                         trail_stop = pos.lowest_price + trail_distance
                         trail_stop = min(trail_stop, pos.entry_price)

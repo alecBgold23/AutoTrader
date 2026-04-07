@@ -562,10 +562,9 @@ class ShortSignalEngine:
 
         # Use the tighter stop (lower value, since stop is above entry)
         stop = min(structural_stop, atr_stop)
-        # Floor: at least 0.3% above entry
-        stop = max(stop, price * 1.003)
         # Ceiling: no more than 5% above entry
         stop = min(stop, price * 1.05)
+        # No tight floor — let structural/ATR stops be as wide as needed
 
         return stop
 

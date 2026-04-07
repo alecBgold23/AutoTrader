@@ -613,7 +613,8 @@ class SignalEngine:
 
         stop = max(structural_stop, atr_stop)
         stop = max(stop, price * 0.95)
-        stop = min(stop, price * 0.997)
+        # No tight cap — let structural/ATR stops be as wide as needed
+        # Position sizing handles risk (smaller position for wider stop)
 
         return stop
 

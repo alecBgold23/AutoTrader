@@ -65,8 +65,8 @@ DEFAULT_ANALYSIS_TIMES = [
 
 # Backtest-specific risk parameters (more aggressive than live for discovery)
 BACKTEST_RISK = {
-    "max_risk_per_trade_pct": 0.50,       # 50% max ($50k on $100k) — day trading, flat by EOD
-    "max_position_pct": 0.50,             # 50% max in one stock
+    "max_risk_per_trade_pct": 0.05,       # 5% risk per trade ($5k on $100k)
+    "max_position_pct": 0.15,             # 15% max in one stock ($15k on $100k)
     "max_total_exposure_pct": 0.80,       # 80% deployed at once
     "max_trades_per_day": 25,             # Room for 20+ trades
     "min_risk_reward_ratio": 1.5,         # Slightly relaxed from 2:1
@@ -303,11 +303,11 @@ class SimulatedPosition:
         self.shares_remaining = self.quantity
         if self.direction == "short":
             # Short targets are BELOW entry
-            self.r_target_1 = self.entry_price - self.risk_per_share * 0.5
-            self.r_target_2 = self.entry_price - self.risk_per_share * 1.5
+            self.r_target_1 = self.entry_price - self.risk_per_share * 1.0
+            self.r_target_2 = self.entry_price - self.risk_per_share * 2.0
         else:
-            self.r_target_1 = self.entry_price + self.risk_per_share * 0.5
-            self.r_target_2 = self.entry_price + self.risk_per_share * 1.5
+            self.r_target_1 = self.entry_price + self.risk_per_share * 1.0
+            self.r_target_2 = self.entry_price + self.risk_per_share * 2.0
         self.current_stop = self.stop_loss
 
 
@@ -961,6 +961,10 @@ class BacktestEngine:
                     if confidence < BACKTEST_RISK["min_confidence_to_trade"]:
                         continue
 
+                    # Require a detected pattern — block NO_SETUP trades
+                    if not pattern or pattern.lower() in ("unknown", "no setup", "no_setup", "none", ""):
+                        continue
+
                     # R:R check with slippage
                     risk = abs(price - stop_loss) + SLIPPAGE_PER_SHARE * 2
                     reward = abs(take_profit - price) - SLIPPAGE_PER_SHARE * 2
@@ -976,9 +980,13 @@ class BacktestEngine:
                         phase_mult = 1.5
                     else:
                         phase_mult = max(phase_mult, 0.40)
-                    # Pattern-quality sizing: ORB patterns get full size, others get 50%
-                    # Data: ORB = +$3,845 from 203 trades, non-ORB = +$96 from 103 trades
-                    pattern_mult = 1.0 if pattern and "ORB" in pattern else 0.50
+                    # All patterns get equal sizing — no backtest-mined bias
+                    pattern_mult = 1.0
+
+                    # Confidence death zone 0.80-0.84: reduce size by 50%
+                    # Data: 167 trades in 0.80-0.86, 40.7% WR, -$12,796
+                    if 0.80 <= confidence < 0.85:
+                        pattern_mult *= 0.50
                     risk_amount = (
                         self.equity
                         * BACKTEST_RISK["max_risk_per_trade_pct"]
@@ -1082,15 +1090,15 @@ class BacktestEngine:
                 current_r = (bar_close - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
             hold_minutes = (current_time - pos.entry_time).total_seconds() / 60
 
-            # 1. Breakeven lock at +0.4R
-            if not pos.breakeven_locked and current_r >= 0.4:
+            # 1. Breakeven lock at +1.0R — gives trades room to breathe
+            if not pos.breakeven_locked and current_r >= 1.0:
                 if is_short:
                     pos.current_stop = min(pos.entry_price, pos.current_stop)
                 else:
                     pos.current_stop = max(pos.entry_price, pos.current_stop)
                 pos.breakeven_locked = True
 
-            # 2. Scale out at 0.5R (direction-aware target check)
+            # 2. Scale out at 1.0R (direction-aware target check)
             target_1_hit = (bar_low <= pos.r_target_1) if is_short else (bar_high >= pos.r_target_1)
             if pos.scale_out_stage == 0 and target_1_hit and pos.shares_remaining > 1:
                 sell_qty = max(1, int(pos.quantity / 3))
@@ -1111,7 +1119,7 @@ class BacktestEngine:
                         entry_price=pos.entry_price, exit_price=exit_price,
                         quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
                         entry_time=pos.entry_time, exit_time=current_time,
-                        exit_reason="Scale out 0.5R (1/3)",
+                        exit_reason="Scale out 1.0R (1/3)",
                         confidence=pos.confidence, direction=pos.direction,
                         slippage_cost=slippage, trading_costs=costs,
                         mae=pos.mae, mfe=pos.mfe,
@@ -1124,7 +1132,7 @@ class BacktestEngine:
                     pos.current_stop = pos.entry_price
                     pos.breakeven_locked = True
 
-            # 3. Scale out at 1.5R
+            # 3. Scale out at 2.0R
             target_2_hit = (bar_low <= pos.r_target_2) if is_short else (bar_high >= pos.r_target_2)
             if pos.scale_out_stage == 1 and target_2_hit and pos.shares_remaining > 1:
                 sell_qty = max(1, int(pos.quantity / 3))
@@ -1145,7 +1153,7 @@ class BacktestEngine:
                         entry_price=pos.entry_price, exit_price=exit_price,
                         quantity=actual_sell, pnl=pnl, r_multiple=r_mult,
                         entry_time=pos.entry_time, exit_time=current_time,
-                        exit_reason="Scale out 1.5R (1/3)",
+                        exit_reason="Scale out 2.0R (1/3)",
                         confidence=pos.confidence, direction=pos.direction,
                         slippage_cost=slippage, trading_costs=costs,
                         mae=pos.mae, mfe=pos.mfe,
@@ -1156,20 +1164,20 @@ class BacktestEngine:
                     pos.realized_pnl += pnl
                     pos.scale_out_stage = 2
 
-            # 4. Time stops
-            if hold_minutes >= 45:
+            # 4. Time stops — extended to give trades room to develop
+            if hold_minutes >= 90:
                 exit_price = bar_close + (SLIPPAGE_PER_SHARE if is_short else -SLIPPAGE_PER_SHARE)
-                self._close_position(sym, exit_price, current_time, "Time stop (45min)")
+                self._close_position(sym, exit_price, current_time, "Time stop (90min)")
                 continue
-            elif hold_minutes >= 20 and current_r <= 0:
-                # Showed some promise but back underwater — cut at 20min
+            elif hold_minutes >= 45 and current_r <= 0:
+                # 45 min underwater — stop loss should have caught real failures
                 exit_price = bar_close + (SLIPPAGE_PER_SHARE if is_short else -SLIPPAGE_PER_SHARE)
-                self._close_position(sym, exit_price, current_time, "Time stop (20min loser)")
+                self._close_position(sym, exit_price, current_time, "Time stop (45min loser)")
                 continue
 
             # 5. Trailing stop (direction-aware)
             if pos.breakeven_locked:
-                trail_distance = 0.5 * pos.risk_per_share
+                trail_distance = 1.0 * pos.risk_per_share
                 if is_short:
                     trail_stop = pos.lowest_price + trail_distance
                     trail_stop = min(trail_stop, pos.entry_price)
