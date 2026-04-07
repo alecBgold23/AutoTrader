@@ -1777,15 +1777,18 @@ JSON only:
     def _scan_for_day(self, day_dt: datetime, daily_bars: dict[str, pd.DataFrame]) -> list[str]:
         """Scan the broad universe for a specific day's movers.
 
-        Mirrors the live MarketScanner._score_stock() logic:
-        - RVOL (relative volume) — 35% weight
-        - Gap from prior close — 25% weight
-        - Momentum / daily change — 15% weight
+        Uses TODAY's opening gap (daily Open vs yesterday's Close) for stock selection.
+        The Open price is known at 9:30 AM — this is NOT look-ahead bias.
+        Yesterday's RVOL and ATR provide the volume/volatility context.
+
+        Scoring weights:
+        - Today's gap from prior close — 35% weight (primary signal)
+        - Prior-day RVOL — 25% weight
+        - Gap + volume combo bonus — 15%
         - ATR volatility — 10% weight
         - Multi-day trend — 8% weight
         - Key level proximity — 7% weight
 
-        Uses ONLY prior-day data (no look-ahead).
         Returns top 15 symbols for this day.
         """
         scores: dict[str, float] = {}
@@ -1794,73 +1797,80 @@ JSON only:
             if daily.empty:
                 continue
 
-            to_date = daily[daily.index < _tz_aware_timestamp(day_dt, daily.index)]
-            if len(to_date) < 10:
+            # Include today's bar (we only use its Open — known at 9:30 AM)
+            to_today = daily[daily.index <= _tz_aware_timestamp(day_dt, daily.index)]
+            if len(to_today) < 11:
                 continue
 
             try:
-                close = to_date["Close"]
-                volume = to_date["Volume"]
-                high = to_date["High"]
-                low = to_date["Low"]
-                openp = to_date["Open"]
+                close = to_today["Close"]
+                volume = to_today["Volume"]
+                high = to_today["High"]
+                low = to_today["Low"]
+                openp = to_today["Open"]
 
-                price = float(close.iloc[-1])
-                prev_close = float(close.iloc[-2])
+                # Today's open (known at 9:30 AM — NOT look-ahead)
                 today_open = float(openp.iloc[-1])
-                today_vol = float(volume.iloc[-1])
-                avg_vol = float(volume.iloc[-20:].mean()) if len(volume) >= 20 else float(volume.mean())
+                # Yesterday's close (prior day's data)
+                yesterday_close = float(close.iloc[-2])
+                # Use yesterday's volume for RVOL (today's full volume is look-ahead)
+                yesterday_vol = float(volume.iloc[-2])
+                # Average volume from prior 20 days (excluding today)
+                prior_vols = volume.iloc[-22:-1] if len(volume) >= 22 else volume.iloc[:-1]
+                avg_vol = float(prior_vols.mean()) if len(prior_vols) > 0 else 1.0
 
-                if price <= 0 or avg_vol <= 0:
+                if yesterday_close <= 0 or avg_vol <= 0:
                     continue
 
-                change_pct = (price - prev_close) / prev_close * 100
-                gap_pct = (today_open - prev_close) / prev_close * 100
-                rvol = today_vol / avg_vol if avg_vol > 0 else 0
+                # TODAY's gap — the key improvement
+                gap_pct = (today_open - yesterday_close) / yesterday_close * 100
+                # Yesterday's RVOL
+                rvol = yesterday_vol / avg_vol if avg_vol > 0 else 0
+                # Yesterday's price change
+                day_before_close = float(close.iloc[-3]) if len(close) >= 3 else yesterday_close
+                change_pct = (yesterday_close - day_before_close) / day_before_close * 100
 
-                # ATR as % of price
+                # ATR from prior days (excluding today's bar which has look-ahead)
+                prior_high = high.iloc[:-1]
+                prior_low = low.iloc[:-1]
+                prior_close = close.iloc[:-1]
                 tr_data = pd.DataFrame({
-                    "hl": high - low,
-                    "hc": (high - close.shift(1)).abs(),
-                    "lc": (low - close.shift(1)).abs(),
+                    "hl": prior_high - prior_low,
+                    "hc": (prior_high - prior_close.shift(1)).abs(),
+                    "lc": (prior_low - prior_close.shift(1)).abs(),
                 })
                 tr = tr_data.max(axis=1)
                 atr = float(tr.iloc[-14:].mean()) if len(tr) >= 14 else float(tr.mean())
-                atr_pct = (atr / price) * 100
+                atr_pct = (atr / yesterday_close) * 100
 
                 score = 0.0
 
-                # 1. RVOL (35% weight)
-                if rvol >= 5.0:
-                    score += 40
-                elif rvol >= 3.0:
-                    score += 30
-                elif rvol >= 2.0:
-                    score += 20
-                elif rvol >= 1.5:
-                    score += 10
-
-                # 2. Gap (25% weight)
+                # 1. TODAY's gap (35% weight — primary signal for day trading)
                 abs_gap = abs(gap_pct)
                 if abs_gap >= 8.0:
-                    score += 30
+                    score += 40
                 elif abs_gap >= 4.0:
-                    score += 22
+                    score += 30
                 elif abs_gap >= 2.0:
-                    score += 12
+                    score += 20
+                elif abs_gap >= 1.0:
+                    score += 8
 
-                # Gap + volume combo
-                if abs_gap >= 3.0 and rvol >= 2.0:
+                # 2. Prior-day RVOL (25% weight)
+                if rvol >= 5.0:
+                    score += 30
+                elif rvol >= 3.0:
+                    score += 22
+                elif rvol >= 2.0:
                     score += 15
+                elif rvol >= 1.5:
+                    score += 8
 
-                # 3. Daily change / momentum (15%)
-                abs_change = abs(change_pct)
-                if abs_change >= 5.0:
+                # 3. Gap + volume combo (15%)
+                if abs_gap >= 3.0 and rvol >= 2.0:
                     score += 18
-                elif abs_change >= 3.0:
-                    score += 12
-                elif abs_change >= 1.5:
-                    score += 6
+                elif abs_gap >= 2.0 and rvol >= 1.5:
+                    score += 10
 
                 # 4. ATR volatility (10%)
                 if atr_pct >= 4.0:
@@ -1871,23 +1881,23 @@ JSON only:
                     score += 4
 
                 # 5. Multi-day trend (8%)
-                if len(close) >= 5:
-                    five_day = (price - float(close.iloc[-5])) / float(close.iloc[-5]) * 100
+                if len(prior_close) >= 5:
+                    five_day = (yesterday_close - float(prior_close.iloc[-5])) / float(prior_close.iloc[-5]) * 100
                     if abs(five_day) >= 15:
                         score += 10
                     elif abs(five_day) >= 8:
                         score += 6
 
-                # 6. Key level proximity (7%)
-                if len(to_date) >= 20:
-                    high_20 = float(high.tail(20).max())
-                    low_20 = float(low.tail(20).min())
-                    if price >= high_20 * 0.97:
+                # 6. Key level proximity (7%) — using prior data only
+                if len(prior_high) >= 20:
+                    high_20 = float(prior_high.tail(20).max())
+                    low_20 = float(prior_low.tail(20).min())
+                    if yesterday_close >= high_20 * 0.97:
                         score += 8
-                    if price <= low_20 * 1.03:
+                    if yesterday_close <= low_20 * 1.03:
                         score += 8
 
-                # Only include if something is happening
+                # Include any stock with a positive score
                 if score > 0:
                     scores[sym] = score
 
