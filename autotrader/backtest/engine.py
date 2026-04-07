@@ -1164,13 +1164,12 @@ class BacktestEngine:
                     pos.realized_pnl += pnl
                     pos.scale_out_stage = 2
 
-            # 4. Time stops — extended to give trades room to develop
+            # 4. Time stops
             if hold_minutes >= 90:
                 exit_price = bar_close + (SLIPPAGE_PER_SHARE if is_short else -SLIPPAGE_PER_SHARE)
                 self._close_position(sym, exit_price, current_time, "Time stop (90min)")
                 continue
             elif hold_minutes >= 45 and current_r <= 0:
-                # 45 min underwater — stop loss should have caught real failures
                 exit_price = bar_close + (SLIPPAGE_PER_SHARE if is_short else -SLIPPAGE_PER_SHARE)
                 self._close_position(sym, exit_price, current_time, "Time stop (45min loser)")
                 continue
