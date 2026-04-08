@@ -263,16 +263,28 @@ These are tuned separately from live (pending sync after validation):
 ./venv/bin/python -m autotrader.backtest.runner --start 2024-12-02 --end 2025-02-28 --model claude-sonnet-4-20250514
 ```
 
-### Latest Results (Apr 2026 data snapshot)
+### Latest Results (Apr 2026, deterministic SignalEngine + death zone block + DT bonus)
 
-| Period | P&L | PF | Trades | WR | Max DD | Sharpe |
-|--------|-----|-----|--------|-----|--------|--------|
-| Apr-Jun 2024 | +$3,516 | 1.12 | 369 | 59.6% | 3.2% | 1.48 |
-| Jun-Aug 2024 | +$6,790 | 1.28 | 381 | 59.6% | 2.3% | 2.63 |
-| Sep-Nov 2024 | -$7,390 | 0.71 | 311 | 48.9% | 9.5% | -3.42 |
-| Dec-Feb 2025 | +$1,578 | 1.54 | 57 | 61.4% | 1.3% | 2.15 |
+Uses deterministic SignalEngine + ShortSignalEngine (no Claude API calls). Key improvements:
+- Long confidence death zone (0.80-0.85) blocked — 28% WR, structural trap
+- Dual Thrust dynamic ORB confirmation bonus (+8 for confirmed breakouts)
+- Short 0.80-0.85 confidence: 50% size reduction (58% WR but thin edge)
 
-**3 of 4 tested periods profitable.** Jan-Mar 2024 could not be tested (Anthropic API credits depleted, cache miss due to re-downloaded 5m data).
+8 overlapping 3-month periods:
+
+| Period | P&L | Trades | Long WR | Short WR |
+|--------|-----|--------|---------|----------|
+| Apr-Jun 2024 | +$943 | 25 | 59% | 50% |
+| May-Jul 2024 | -$1,467 | 33 | 20% | 44% |
+| Jun-Aug 2024 | +$1,484 | 53 | 32% | 71% |
+| Jul-Sep 2024 | -$222 | 20 | 27% | 44% |
+| Aug-Oct 2024 | +$1,598 | 26 | 46% | 69% |
+| Sep-Nov 2024 | +$1,201 | 28 | 69% | 58% |
+| Oct-Dec 2024 | -$27 | 13 | 40% | 63% |
+| Dec-Feb 2025 | +$279 | 18 | 85% | 0% |
+| **Total** | **+$3,788** | **216** | | |
+
+**6 of 8 periods profitable** (up from 5/8). Shorts remain the core edge (+$2,146 ORB Breakdown). Death zone block improved total by +$905 vs baseline.
 
 **Important caveat:** Results are sensitive to which yfinance daily data is cached. Data downloaded on different dates can produce slightly different adjusted prices, which changes scanner scores and symbol selection. Always establish a fresh baseline before comparing changes.
 
@@ -400,9 +412,10 @@ Claude sees "{trades_today}/8 trades used" and is taught to pace itself.
 
 ## Known Issues / Not Yet Configured
 
-- **Live ≈ Backtest parameters** — Live now uses same risk params (15% per trade, 20% max position, 80% exposure), same signal engines (long + short), same position management (1/3 scale-outs at 0.5R and 1.5R, 0.4R breakeven lock, trailing stops). Minor differences: live uses broker-side stops (GTC) for crash protection; backtest uses simulated close-based stops.
-- **Anthropic API credits depleted** — The API key in `.env` has $0 balance. Backtests rely entirely on cached Claude responses. Any cache miss (new symbols, changed data) fails silently with 0 trades for that analysis cycle. Need to top up credits to test new periods or invalidate cache.
-- **Jan-Mar 2024 backtest broken** — 5m bar data was re-downloaded, changing price/volume values, which invalidated all Claude cache keys for that period. Requires fresh API credits to re-cache.
+- **Deterministic mode** — System uses SignalEngine + ShortSignalEngine for all decisions. No Claude API calls needed. Claude cache is unused in deterministic mode.
+- **Live ≈ Backtest parameters** — Live now uses same risk params (5% per trade, 15% max position, 80% exposure), same signal engines (long + short), same position management (1/2 at 1R, trailing stop). Minor differences: live uses broker-side stops (GTC) for crash protection; backtest uses simulated close-based stops.
+- **Long engine selectivity** — Long MIN_SCORE raised to 65 (vs short's 62). Long confidence death zone (0.80-0.85) completely blocked: 28% WR, -$1,592 across 53 trades. Short death zone kept at 50% size reduction (58% WR, neutral P&L).
+- **Dual Thrust dynamic range** — `calculate_dual_thrust_range()` in indicators.py computes adaptive ORB thresholds from 5-day price action. Confirmed ORB breakouts (exceeding DT level) get +8 score bonus. Infrastructure available for future use as standalone setup.
 - **launchd import error** — `alpaca.data.news.NewsClient` module not found on launchd restart. The Friday process (manual `run.py`) works fine. Need to fix the launchd plist Python/venv path.
 - **Telegram** not configured — alerts are silently skipped
 - **Shorting enabled in both live and backtest** — `ShortSignalEngine` (`signals/short_engine.py`) integrated into both `backtest/engine.py` and `main.py` with direction-aware P&L, stops, scale-outs, trailing stops, and broker stop orders. Patterns: ORB Breakdown, VWAP Rejection, Bear Flag, LOD Break. Gap & Fade blocked. Controlled via `ENABLE_SHORT` in `config.py`.

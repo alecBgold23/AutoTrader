@@ -212,6 +212,45 @@ def calculate_intraday_indicators(df_5m: pd.DataFrame) -> dict:
         return {}
 
 
+def calculate_dual_thrust_range(daily_df: pd.DataFrame, today_open: float,
+                                lookback: int = 5, k1: float = 0.5, k2: float = 0.5) -> dict:
+    """Dual Thrust dynamic range — adaptive ORB replacement.
+
+    Uses multi-day price action to set breakout thresholds that adapt to
+    recent volatility. On quiet days, range is smaller → tighter triggers.
+    On volatile days, range is wider → fewer false breakouts.
+
+    Formula:
+        range = max(HH(N) - LC(N), HC(N) - LL(N))
+        upper = today_open + k1 * range
+        lower = today_open - k2 * range
+
+    Where HH=highest high, LC=lowest close, HC=highest close, LL=lowest low
+    over the lookback period.
+
+    Returns dict with dt_upper, dt_lower, dt_range, or empty dict if insufficient data.
+    """
+    if daily_df is None or len(daily_df) < lookback:
+        return {}
+
+    recent = daily_df.iloc[-lookback:]
+    hh = float(recent["High"].max())
+    ll = float(recent["Low"].min())
+    hc = float(recent["Close"].max())
+    lc = float(recent["Close"].min())
+
+    # Dual Thrust range: max of (HH-LC, HC-LL)
+    dt_range = max(hh - lc, hc - ll)
+    if dt_range <= 0:
+        return {}
+
+    return {
+        "dt_upper": round(today_open + k1 * dt_range, 2),
+        "dt_lower": round(today_open - k2 * dt_range, 2),
+        "dt_range": round(dt_range, 2),
+    }
+
+
 def get_signal_summary(indicators: dict) -> str:
     """Generate a human-readable signal summary from indicators."""
     if not indicators:

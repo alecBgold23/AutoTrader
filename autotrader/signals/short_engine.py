@@ -403,12 +403,16 @@ class ShortSignalEngine:
 
         # ── ORB Breakdown ──
         or_low = intra.get("or_low")
+        dt_lower = levels.get("dt_lower")
         if or_low and price < or_low and or_low > 0:
             extension_pct = (or_low - price) / or_low * 100
             if extension_pct <= 2.0:  # Not too extended below OR low
                 score += 35
                 if setup == ShortSetupType.NO_SETUP:
                     setup = ShortSetupType.ORB_BREAKDOWN
+                # Dual Thrust confirmation bonus — price below multi-day dynamic range
+                if dt_lower and price <= dt_lower:
+                    score += 8
                 # Volume confirmation bonus (additive, not a gate)
                 vol_acc = intra.get("volume_acceleration")
                 if vol_acc is not None and vol_acc >= 1.5:
@@ -434,6 +438,10 @@ class ShortSignalEngine:
                 score += 25
                 if setup == ShortSetupType.NO_SETUP:
                     setup = ShortSetupType.FAILED_BREAKOUT
+
+        # ── First Pullback Short ── BLOCKED
+        # Long side data: 0/10+ trades, -$1,100+. Detection too loose.
+        # Do NOT assign score or setup.
 
         # ── LOD Break ──
         today_low = levels.get("today_low")

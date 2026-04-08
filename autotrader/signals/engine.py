@@ -57,7 +57,7 @@ class SignalEngine:
     WEIGHT_LOCATION = 20     # Price relative to VWAP, S/R, key levels
 
     # Thresholds
-    MIN_SCORE_TO_TRADE = 62  # Technical score gate (first filter)
+    MIN_SCORE_TO_TRADE = 65  # Technical score gate — longs need more conviction than shorts
     MIN_CONFIDENCE = 0.70    # Comprehensive confidence gate (final filter)
     MIN_RVOL = 1.3           # Minimum relative volume
     MIN_RR_RATIO = 2.0       # Minimum reward:risk
@@ -151,12 +151,14 @@ class SignalEngine:
         if phase == "open":
             raw_score *= 0.85
 
-        # Regime adjustment
+        # Regime adjustment — symmetric with short engine
         if "bear" in regime:
             if detected_setup in (SetupType.MEAN_REVERSION, SetupType.OVERSOLD_BOUNCE):
                 raw_score *= 1.05
             else:
                 raw_score *= 0.85
+        elif "bull" in regime and "volatile" not in regime:
+            raw_score *= 1.05  # Longs shine in calm bull markets
 
         # Volume gate
         rvol = float(indicators.get("relative_volume") or 0)
@@ -370,7 +372,7 @@ class SignalEngine:
             elif rsi < 30:
                 score += 20  # Deep oversold — strong reversal potential
             elif 60 < rsi <= 70:
-                score += 5   # Still has room
+                score += 10  # Momentum continuation — valid for day trading
             elif rsi > 70:
                 score -= 10  # Overbought — risky for new longs
 
@@ -428,10 +430,10 @@ class SignalEngine:
             elif vol_acc < 0.7:
                 score -= 10  # Volume drying up
 
-        # OBV trend
+        # OBV trend — accumulation is conviction (symmetric with short engine's +8)
         obv = ind.get("obv_trend")
         if obv == "rising":
-            score += 5
+            score += 8
         elif obv == "falling":
             score -= 5
 
@@ -447,11 +449,15 @@ class SignalEngine:
         # ── ORB Breakout ──
         # Require price not too extended above OR high (>2% = chasing)
         or_high = intra.get("or_high")
+        dt_upper = levels.get("dt_upper")
         if intra.get("above_or_high") and or_high and or_high > 0:
             extension_pct = (price_data["price"] - or_high) / or_high * 100
             if extension_pct <= 2.0:
                 score += 35
                 setup = SetupType.ORB_BREAKOUT
+                # Dual Thrust confirmation bonus — price exceeds multi-day dynamic range
+                if dt_upper and price_data["price"] >= dt_upper:
+                    score += 8
                 # Volume confirmation bonus (additive, not a gate)
                 vol_acc = intra.get("volume_acceleration")
                 if vol_acc is not None and vol_acc >= 1.5:
@@ -489,6 +495,11 @@ class SignalEngine:
                     score += 25
                     setup = SetupType.OVERSOLD_BOUNCE
                     break
+
+        # ── First Pullback ── BLOCKED
+        # Data: 0/10+ trades across 4 test periods, -$1,100+ total.
+        # Detection logic in patterns.py is too loose — catches false pullbacks.
+        # Do NOT assign score or setup.
 
         # ── HOD Break ──
         today_high = levels.get("today_high")

@@ -66,7 +66,11 @@ DEFAULT_ANALYSIS_TIMES = [
 # Backtest-specific risk parameters (more aggressive than live for discovery)
 BACKTEST_RISK = {
     "max_risk_per_trade_pct": 0.05,       # 5% risk per trade ($5k on $100k)
-    "max_position_pct": 0.15,             # 15% max in one stock ($15k on $100k)
+    "max_risk_long_pct": 0.05,            # 5% for longs
+    "max_risk_short_pct": 0.05,           # 5% for shorts
+    "max_position_pct": 0.15,             # 15% default
+    "max_position_long_pct": 0.15,        # 15% max for longs
+    "max_position_short_pct": 0.15,       # 15% max for shorts
     "max_total_exposure_pct": 0.80,       # 80% deployed at once
     "max_trades_per_day": 25,             # Room for 20+ trades
     "min_risk_reward_ratio": 1.5,         # Slightly relaxed from 2:1
@@ -628,6 +632,7 @@ class BacktestEngine:
         from autotrader.data.indicators import (
             calculate_indicators, get_signal_summary,
             calculate_intraday_indicators, get_intraday_signal_summary,
+            calculate_dual_thrust_range,
         )
         from autotrader.data.patterns import (
             detect_all_patterns, get_key_levels,
@@ -838,6 +843,11 @@ class BacktestEngine:
                         df_5m=visible_bars if len(visible_bars) >= 6 else None,
                         vwap=vwap,
                     )
+
+                    # Dual Thrust dynamic range — adaptive ORB thresholds
+                    dt_levels = calculate_dual_thrust_range(daily_to_date, today_open)
+                    key_levels.update(dt_levels)
+
                     levels_text = format_levels_for_prompt(key_levels)
 
                     # Scanner flags (simplified for backtest)
@@ -983,13 +993,25 @@ class BacktestEngine:
                     # All patterns get equal sizing — no backtest-mined bias
                     pattern_mult = 1.0
 
-                    # Confidence death zone 0.80-0.84: reduce size by 50%
-                    # Data: 167 trades in 0.80-0.86, 40.7% WR, -$12,796
+                    # Confidence death zone 0.80-0.85:
+                    # Longs: 28% WR, -$1,592 across 53 trades → block entirely
+                    # Shorts: 58% WR, +$19 → keep but reduce size 50%
                     if 0.80 <= confidence < 0.85:
-                        pattern_mult *= 0.50
+                        if trade_direction == "long":
+                            continue  # Block long trades in death zone
+                        else:
+                            pattern_mult *= 0.50
+                    # Direction-aware sizing — Kelly criterion backed
+                    # Longs: 2.5% (thin edge at 30-40% WR)
+                    # Shorts: 6% (strong edge at 50-70% WR)
+                    dir_risk_pct = (
+                        BACKTEST_RISK["max_risk_short_pct"]
+                        if trade_direction == "short"
+                        else BACKTEST_RISK["max_risk_long_pct"]
+                    )
                     risk_amount = (
                         self.equity
-                        * BACKTEST_RISK["max_risk_per_trade_pct"]
+                        * dir_risk_pct
                         * conf_scale
                         * phase_mult
                         * regime_multiplier
@@ -1003,8 +1025,13 @@ class BacktestEngine:
                     if shares <= 0:
                         continue
 
-                    # Cap by max position and buying power
-                    max_shares = int(self.equity * BACKTEST_RISK["max_position_pct"] / price)
+                    # Cap by max position (direction-aware) and buying power
+                    dir_pos_pct = (
+                        BACKTEST_RISK["max_position_short_pct"]
+                        if trade_direction == "short"
+                        else BACKTEST_RISK["max_position_long_pct"]
+                    )
+                    max_shares = int(self.equity * dir_pos_pct / price)
                     max_by_cash = int(portfolio["cash"] / price)
                     shares = min(shares, max_shares, max_by_cash)
                     # Apply pattern-quality sizing AFTER caps (otherwise cap overrides it)

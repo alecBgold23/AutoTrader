@@ -27,7 +27,7 @@ from autotrader.signals.short_engine import ShortSignalEngine
 from autotrader.execution.broker import AlpacaBroker
 from autotrader.data.scanner import MarketScanner
 from autotrader.data.market import get_current_price, get_stock_data, get_intraday_data
-from autotrader.data.indicators import calculate_indicators, calculate_intraday_indicators
+from autotrader.data.indicators import calculate_indicators, calculate_intraday_indicators, calculate_dual_thrust_range
 from autotrader.data.patterns import (
     detect_all_patterns, format_patterns_for_prompt,
     get_key_levels, format_levels_for_prompt,
@@ -468,6 +468,11 @@ class AutoTrader:
             vwap=vwap,
         )
 
+        # Dual Thrust dynamic range — adaptive ORB thresholds
+        today_open = price_data.get("open", price_data.get("price", 0))
+        dt_levels = calculate_dual_thrust_range(daily, today_open)
+        key_levels.update(dt_levels)
+
         # ── Call both signal engines — mirrors backtest ──
         regime_str = self.regime.state.regime if self.regime.state else "unknown"
         score_kwargs = dict(
@@ -545,9 +550,14 @@ class AutoTrader:
         pattern = decision.pattern if hasattr(decision, 'pattern') else ""
         pattern_mult = 1.0
 
-        # Confidence death zone 0.80-0.84: reduce size by 50%
+        # Confidence death zone 0.80-0.85:
+        # Longs: 28% WR, -$1,592 across 53 trades → block entirely
+        # Shorts: 58% WR, +$19 → keep but reduce size 50%
         if 0.80 <= confidence < 0.85:
-            pattern_mult *= 0.50
+            if direction == "long":
+                return  # Block long trades in death zone
+            else:
+                pattern_mult *= 0.50
 
         risk_amount = (
             equity
