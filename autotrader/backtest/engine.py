@@ -41,41 +41,35 @@ def _tz_aware_timestamp(dt, index):
         ts = ts.tz_localize(index.tz)
     return ts
 
-# Analysis times ordered for best full-day coverage when sliced to [:N].
-# First 10 cover every phase of the day; extras fill prime-time gaps.
-# Phase blocking is handled by the signal engine (blocks lunch, afternoon,
-# close, premarket) and the backtest engine (blocks late-day entries).
-DEFAULT_ANALYSIS_TIMES = [
-    time(9, 35),   # Open (ORB forming)
-    time(10, 0),   # Prime start (10 AM reversal zone)
-    time(10, 30),  # Prime mid
-    time(10, 50),  # Prime late
-    time(11, 0),   # Late morning (lunch blocked by signal engine)
-    time(11, 45),  # Lunch (blocked by signal engine)
-    time(13, 0),   # Mid-day (blocked by signal engine)
-    time(14, 0),   # Afternoon (blocked by signal engine)
-    time(14, 45),  # Afternoon late (blocked by signal engine)
-    time(15, 15),  # Power hour
-    # Extra slots if cycles > 10
-    time(9, 50),   # Late open
-    time(10, 15),  # Prime extra
-    time(10, 45),  # Prime extra
-    time(14, 30),  # Afternoon mid (blocked)
-]
+# Generate analysis times every 5 minutes from 9:35 to 15:45.
+# Real traders scan continuously — fixed 10 slots was the #1 bottleneck.
+# Signal engine handles quality gating via confidence model + phase component.
+def _generate_analysis_times():
+    """Generate analysis times every 5 minutes across the full trading day."""
+    times = []
+    # 9:35 to 15:45 in 5-minute increments
+    for h in range(9, 16):
+        start_m = 35 if h == 9 else 0
+        end_m = 50 if h == 15 else 60
+        for m in range(start_m, end_m, 5):
+            times.append(time(h, m))
+    return times
+
+DEFAULT_ANALYSIS_TIMES = _generate_analysis_times()  # ~75 slots per day
 
 # Backtest-specific risk parameters (more aggressive than live for discovery)
 BACKTEST_RISK = {
-    "max_risk_per_trade_pct": 0.05,       # 5% risk per trade ($5k on $100k)
-    "max_risk_long_pct": 0.05,            # 5% for longs
-    "max_risk_short_pct": 0.05,           # 5% for shorts
-    "max_position_pct": 0.15,             # 15% default
-    "max_position_long_pct": 0.15,        # 15% max for longs
-    "max_position_short_pct": 0.15,       # 15% max for shorts
-    "max_total_exposure_pct": 0.80,       # 80% deployed at once
+    "max_risk_per_trade_pct": 0.12,       # 12% risk per trade — day trading, flat EOD, bounded risk
+    "max_risk_long_pct": 0.05,            # 5% for longs — thin edge (30-43% WR), keep small
+    "max_risk_short_pct": 0.20,           # 20% for shorts — strong edge (57-84% WR), concentrate here
+    "max_position_pct": 0.45,             # 45% max single position (confidence cap is the real limit)
+    "max_position_long_pct": 0.20,        # 20% max for longs (reduced — weak direction)
+    "max_position_short_pct": 0.45,       # 45% max for shorts (confidence cap governs)
+    "max_total_exposure_pct": 0.90,       # 90% deployed at once
     "max_trades_per_day": 25,             # Room for 20+ trades
     "min_risk_reward_ratio": 1.5,         # Slightly relaxed from 2:1
     "min_confidence_to_trade": 0.65,      # Raised from 0.50 — data shows <0.65 degrades PF
-    "analyze_count": 10,                  # Symbols per cycle (filtered by pre-filter)
+    "analyze_count": 25,                  # Symbols per cycle — more opportunities
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -190,8 +184,11 @@ def _is_momentum_pattern(pattern: str) -> bool:
     return False
 
 
-def _confidence_risk_scale(confidence: float) -> float:
+def _confidence_risk_scale(confidence: float, direction: str = "long") -> float:
     """Scale risk amount by confidence. Higher confidence = bigger bet.
+
+    Smooth continuous curve — no arbitrary breakpoints. Structurally:
+    "if the model is more confident, size larger" (Kelly criterion principle).
 
     0.65 confidence → 30% of max risk
     0.70 confidence → 45% of max risk
@@ -202,6 +199,22 @@ def _confidence_risk_scale(confidence: float) -> float:
     c = max(0.65, min(1.0, confidence))
     normalized = (c - 0.65) / 0.35
     return 0.30 + 0.70 * (normalized ** 1.2)
+
+
+def _confidence_position_cap(confidence: float, direction: str = "long") -> float:
+    """Dynamic position cap that scales smoothly with confidence.
+
+    Fixes a modeling issue: a flat position cap makes confidence scaling
+    meaningless because all trades hit the same cap. This scales the cap
+    proportionally so higher confidence = larger allowed position.
+
+    Uses the same smooth curve as risk scaling — no arbitrary breakpoints.
+    """
+    # Scale cap from 10% to 50% of equity based on confidence
+    c = max(0.65, min(1.0, confidence))
+    normalized = (c - 0.65) / 0.35
+    scale = 0.30 + 0.70 * (normalized ** 1.2)  # Same curve as risk scale
+    return 0.10 + 0.40 * scale  # 10% floor, 50% ceiling
 
 
 # ═══════════════════════════════════════════════════════════
@@ -431,7 +444,7 @@ class BacktestEngine:
         end: str,
         starting_equity: float = 100_000.0,
         model: str = "claude-haiku-4-5-20251001",
-        max_cycles_per_day: int = 10,
+        max_cycles_per_day: int = 75,
         max_trades_per_day: int = 25,
         deterministic: bool = True,
         signal_params: dict | None = None,
@@ -702,8 +715,13 @@ class BacktestEngine:
                 break
 
             # ── Fill pending orders at this bar's open ──
+            fill_phase = self._get_phase(hour, minute)
             for sym in list(pending_orders.keys()):
                 if sym in sym_day_bars and sym not in self.positions:
+                    # Don't fill orders during lunch or afternoon
+                    if fill_phase in ("lunch", "afternoon"):
+                        pending_orders.pop(sym)
+                        continue
                     today_df = sym_day_bars[sym]
                     if current_time in today_df.index:
                         bar = today_df.loc[current_time]
@@ -750,14 +768,11 @@ class BacktestEngine:
                 if phase_config.get("size_multiplier", 1.0) <= 0:
                     continue
 
-                # Block lunch phase from new entries — structurally low volume,
-                # wider spreads, mean reversion traps. Still manage existing positions.
-                if phase == "lunch":
+                # Block lunch and afternoon — signal engine blocks both, but belt-and-suspenders.
+                if phase in ("lunch", "afternoon"):
                     continue
-
-                # Block new entries after 2:30 PM ET — late-day entries have
-                # low win rates and leave no time for thesis to play out.
-                if hour >= 15 or (hour == 14 and minute >= 30):
+                # Block entries after 3:35 PM — not enough time for thesis to play out
+                if hour == 15 and minute >= 35:
                     continue
 
                 # Check daily loss halt
@@ -874,10 +889,13 @@ class BacktestEngine:
                         })
                         total_position_value += pv
 
+                    # Day trading account: 2:1 intraday margin (conservative vs 4:1 PDT)
+                    # Shorts require ~50% margin, not 100%. Model as 2x buying power.
+                    raw_cash = self.equity - total_position_value
                     portfolio = {
                         "equity": self.equity,
-                        "cash": self.equity - total_position_value,
-                        "buying_power": self.equity - total_position_value,
+                        "cash": raw_cash,
+                        "buying_power": max(0, raw_cash * 2),  # 2:1 margin
                         "positions": positions_list,
                         "daily_pnl": self.daily_pnl,
                     }
@@ -981,26 +999,17 @@ class BacktestEngine:
                     if risk <= 0 or reward <= 0 or reward / risk < BACKTEST_RISK["min_risk_reward_ratio"]:
                         continue
 
-                    # Confidence-based position sizing
-                    conf_scale = _confidence_risk_scale(confidence)
+                    # Confidence-based position sizing — smooth curve, no pattern overrides
+                    conf_scale = _confidence_risk_scale(confidence, trade_direction)
                     phase_mult = phase_config.get("size_multiplier", 1.0)
-                    # Open phase (9:30-10:00 ET) has highest edge — boost sizing 1.5x
-                    # Structurally: highest volume, clearest setups, most momentum
                     if phase == "open":
                         phase_mult = 1.5
                     else:
                         phase_mult = max(phase_mult, 0.40)
-                    # All patterns get equal sizing — no backtest-mined bias
                     pattern_mult = 1.0
 
-                    # Confidence death zone 0.80-0.85:
-                    # Longs: 28% WR, -$1,592 across 53 trades → block entirely
-                    # Shorts: 58% WR, +$19 → keep but reduce size 50%
-                    if 0.80 <= confidence < 0.85:
-                        if trade_direction == "long":
-                            continue  # Block long trades in death zone
-                        else:
-                            pattern_mult *= 0.50
+                    # Death zone removed — confidence model rebalanced, old 0.80-0.85
+                    # distribution will shift with new thresholds
                     # Direction-aware sizing — Kelly criterion backed
                     # Longs: 2.5% (thin edge at 30-40% WR)
                     # Shorts: 6% (strong edge at 50-70% WR)
@@ -1025,14 +1034,10 @@ class BacktestEngine:
                     if shares <= 0:
                         continue
 
-                    # Cap by max position (direction-aware) and buying power
-                    dir_pos_pct = (
-                        BACKTEST_RISK["max_position_short_pct"]
-                        if trade_direction == "short"
-                        else BACKTEST_RISK["max_position_long_pct"]
-                    )
-                    max_shares = int(self.equity * dir_pos_pct / price)
-                    max_by_cash = int(portfolio["cash"] / price)
+                    # Cap by dynamic position limit (confidence-based) and buying power
+                    conf_cap = _confidence_position_cap(confidence, trade_direction)
+                    max_shares = int(self.equity * conf_cap / price)
+                    max_by_cash = int(portfolio["buying_power"] / price)
                     shares = min(shares, max_shares, max_by_cash)
                     # Apply pattern-quality sizing AFTER caps (otherwise cap overrides it)
                     shares = max(1, int(shares * pattern_mult))
@@ -1117,8 +1122,8 @@ class BacktestEngine:
                 current_r = (bar_close - pos.entry_price) / pos.risk_per_share if pos.risk_per_share > 0 else 0
             hold_minutes = (current_time - pos.entry_time).total_seconds() / 60
 
-            # 1. Breakeven lock at +1.0R — gives trades room to breathe
-            if not pos.breakeven_locked and current_r >= 1.0:
+            # 1. Breakeven lock at +0.7R — lock in profit, 30% of losers had MFE > 0.3%
+            if not pos.breakeven_locked and current_r >= 0.7:
                 if is_short:
                     pos.current_stop = min(pos.entry_price, pos.current_stop)
                 else:
@@ -1201,9 +1206,9 @@ class BacktestEngine:
                 self._close_position(sym, exit_price, current_time, "Time stop (45min loser)")
                 continue
 
-            # 5. Trailing stop (direction-aware)
+            # 5. Trailing stop (direction-aware) — 0.7R tight trail for day trading
             if pos.breakeven_locked:
-                trail_distance = 1.0 * pos.risk_per_share
+                trail_distance = 0.7 * pos.risk_per_share
                 if is_short:
                     trail_stop = pos.lowest_price + trail_distance
                     trail_stop = min(trail_stop, pos.entry_price)
@@ -1930,9 +1935,9 @@ JSON only:
             except Exception:
                 continue
 
-        # Return top 15 by score (matches live scanner behavior)
+        # Return top 25 by score — more candidates = more opportunities
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return [sym for sym, _ in ranked[:15]]
+        return [sym for sym, _ in ranked[:25]]
 
     _CORRELATED_GROUPS = {
         "mega_tech": {"AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN"},

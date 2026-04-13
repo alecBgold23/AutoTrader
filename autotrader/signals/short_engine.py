@@ -56,11 +56,11 @@ class ShortSignalEngine:
     WEIGHT_LOCATION = 20     # Extended from key levels, resistance rejection
 
     # Thresholds
-    MIN_SCORE_TO_TRADE = 62
-    MIN_CONFIDENCE = 0.70
-    MIN_RVOL = 1.3
-    MIN_RR_RATIO = 2.0
-    MIN_CONFLUENCE = 3       # Minimum bearish factors (out of 5)
+    MIN_SCORE_TO_TRADE = 48  # Confidence model is the real quality filter
+    MIN_CONFIDENCE = 0.64    # Higher bar for shorts — structurally harder to profit
+    MIN_RVOL = 1.0           # Volume scored, not hard-gated
+    MIN_RR_RATIO = 1.8       # Slightly relaxed
+    MIN_CONFLUENCE = 2       # Two strong bearish factors enough
 
     # Price tier — same as long side, cheap stocks are untradeable
     MIN_PRICE = 30
@@ -97,11 +97,9 @@ class ShortSignalEngine:
         if price < self.MIN_PRICE or price > self.MAX_PRICE:
             return self._hold(symbol, price, 0, f"Price ${price:.0f} outside range")
 
-        # Phase gate — same blocked phases as longs
-        if phase in ("lunch", "close", "premarket"):
+        # Phase gate — afternoon negative in 6/8 test periods
+        if phase in ("close", "premarket", "lunch", "afternoon"):
             return self._hold(symbol, price, 0, f"Phase {phase} blocked")
-        if phase == "afternoon":
-            return self._hold(symbol, price, 0, "Afternoon blocked")
 
         # ══════ STAGE 1: TECHNICAL SCORE ══════
         trend_score = self._score_trend_bearish(indicators, intraday_indicators)
@@ -189,6 +187,13 @@ class ShortSignalEngine:
             return self._hold(symbol, price, raw_score,
                               f"Confidence {confidence:.2f} below {self.MIN_CONFIDENCE}")
 
+        # Phase-specific confidence floors
+        phase_min_conf = {"power_hour": 0.72}
+        phase_floor = phase_min_conf.get(phase, 0.0)
+        if confidence < phase_floor:
+            return self._hold(symbol, price, raw_score,
+                              f"Confidence {confidence:.2f} below {phase} floor {phase_floor}")
+
         # ══════ BUILD DECISION ══════
         reasoning_parts = []
         if detected_setup != ShortSetupType.NO_SETUP:
@@ -229,23 +234,25 @@ class ShortSignalEngine:
         else:
             confluence_component = 0.0
 
-        # 3. Price tier (0.20) — same sweet spots apply to shorts
+        # 3. Price tier (0.15) — same sweet spots apply to shorts
         if 60 <= price <= 150:
             price_component = 1.0
         elif 150 < price <= 300:
-            price_component = 0.7
+            price_component = 0.8
         elif 300 < price <= 500:
-            price_component = 0.5
+            price_component = 0.6
         elif 30 <= price < 60:
-            price_component = 0.25
+            price_component = 0.50
         else:
-            price_component = 0.1
+            price_component = 0.2
 
-        # 4. Phase (0.15) — prime is best for shorts too
+        # 4. Phase (0.15) — full day coverage
         phase_map = {
             "prime": 1.0,
-            "power_hour": 0.7,
-            "open": 0.4,
+            "power_hour": 0.8,
+            "open": 0.5,
+            "afternoon": 0.6,
+            "lunch": 0.3,
         }
         phase_component = phase_map.get(phase, 0.3)
 
@@ -260,9 +267,9 @@ class ShortSignalEngine:
             risk_component = 0.2
 
         confidence = (
-            0.35 * tech_component +
+            0.40 * tech_component +
             0.20 * confluence_component +
-            0.20 * price_component +
+            0.15 * price_component +
             0.15 * phase_component +
             0.10 * risk_component
         )
@@ -395,30 +402,28 @@ class ShortSignalEngine:
         price = price_data["price"]
         gap_pct = price_data.get("change_pct", 0)
 
-        # ── Gap & Fade ── BLOCKED
-        # Data: 23.1% WR, -$1,583 in 2024. Same as Gap & Go on long side —
-        # gap patterns are unreliable intraday regardless of direction.
+        # ── Gap & Fade ── BLOCKED (11.1% WR)
+        # Structurally: fading large gaps is fighting the day's strongest momentum.
         # Do NOT assign score or setup.
+        rvol_pat = float(ind.get("relative_volume") or 0)
         vwap = ind.get("vwap") or intra.get("vwap_5m")
 
         # ── ORB Breakdown ──
+        # Require volume confirmation — real breakdowns need selling pressure
         or_low = intra.get("or_low")
         dt_lower = levels.get("dt_lower")
+        vol_acc = intra.get("volume_acceleration")
         if or_low and price < or_low and or_low > 0:
             extension_pct = (or_low - price) / or_low * 100
-            if extension_pct <= 2.0:  # Not too extended below OR low
-                score += 35
+            has_volume = vol_acc is not None and vol_acc >= 1.3
+            if extension_pct <= 1.5 and has_volume:
+                score += 30
                 if setup == ShortSetupType.NO_SETUP:
                     setup = ShortSetupType.ORB_BREAKDOWN
-                # Dual Thrust confirmation bonus — price below multi-day dynamic range
                 if dt_lower and price <= dt_lower:
-                    score += 8
-                # Volume confirmation bonus (additive, not a gate)
-                vol_acc = intra.get("volume_acceleration")
-                if vol_acc is not None and vol_acc >= 1.5:
-                    score += 5
-            else:
-                score += 10
+                    score += 10
+            elif extension_pct <= 1.5:
+                score += 10  # Breakdown without volume = low conviction
 
         # ── VWAP Rejection ──
         # Price is below VWAP and tried to get above but failed
@@ -471,14 +476,16 @@ class ShortSignalEngine:
         if "morning_star" in patterns_text.lower():
             score -= 12
 
-        # ── Momentum breakdown ──
+        # ── Momentum breakdown / Bearish continuation ──
         ema_bearish = intra.get("ema_bullish_5m") is False
         below_vwap = intra.get("above_vwap_5m") is False
-        if ema_bearish and below_vwap and gap_pct < -1.0:
-            if setup == ShortSetupType.NO_SETUP:
-                pass  # Blocked as standalone — weak signal
-            else:
-                score += 15  # Strong as confirmation
+        if ema_bearish and below_vwap:
+            if setup != ShortSetupType.NO_SETUP:
+                score += 15  # Confirmation bonus
+            elif rvol_pat >= 1.3:
+                # Standalone bearish continuation — needs volume
+                score += 15
+                setup = ShortSetupType.MOMENTUM_BREAKDOWN
 
         return max(0, min(100, score)), setup
 

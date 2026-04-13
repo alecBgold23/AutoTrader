@@ -28,8 +28,8 @@ def main():
     parser.add_argument(
         "--max-cycles-per-day",
         type=int,
-        default=10,
-        help="Max analysis cycles per day (default: 10)",
+        default=75,
+        help="Max analysis cycles per day (default: 75)",
     )
     parser.add_argument("--equity", type=float, default=100_000, help="Starting equity (default: 100000)")
     parser.add_argument("--max-trades", type=int, default=25, help="Max trades per day (default: 25)")

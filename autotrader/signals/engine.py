@@ -57,11 +57,11 @@ class SignalEngine:
     WEIGHT_LOCATION = 20     # Price relative to VWAP, S/R, key levels
 
     # Thresholds
-    MIN_SCORE_TO_TRADE = 65  # Technical score gate — longs need more conviction than shorts
-    MIN_CONFIDENCE = 0.70    # Comprehensive confidence gate (final filter)
-    MIN_RVOL = 1.3           # Minimum relative volume
-    MIN_RR_RATIO = 2.0       # Minimum reward:risk
-    MIN_CONFLUENCE = 3       # Minimum bullish factors (out of 5)
+    MIN_SCORE_TO_TRADE = 50  # Technical score gate — confidence model is the real quality filter
+    MIN_CONFIDENCE = 0.60    # Comprehensive confidence gate (final filter)
+    MIN_RVOL = 1.0           # Minimum relative volume (volume already scored 0-100)
+    MIN_RR_RATIO = 1.8       # Minimum reward:risk (slightly relaxed for more entries)
+    MIN_CONFLUENCE = 2       # Minimum bullish factors (out of 5) — two strong factors enough
 
     # Price tier — cheap stocks have terrible cost efficiency
     MIN_PRICE = 30           # Hard floor: skip penny stocks (34.7% WR, $43 avg cost)
@@ -114,12 +114,9 @@ class SignalEngine:
             return self._hold(symbol, price, 0, f"Price ${price:.0f} above ${self.MAX_PRICE} maximum")
 
         # ══════ PHASE GATE ══════
-        # Afternoon: 30% WR across 4 quarters, -$4,140 total. Block it.
-        # Lunch: already blocked by the backtest engine, but double-check.
-        if phase in ("lunch", "close", "premarket"):
+        # Afternoon: negative in 6/8 test periods (-$7,000+ total). Low volume, choppy action.
+        if phase in ("close", "premarket", "lunch", "afternoon"):
             return self._hold(symbol, price, 0, f"Phase {phase} blocked")
-        if phase == "afternoon":
-            return self._hold(symbol, price, 0, "Afternoon phase blocked (30% WR across all periods)")
 
         # ══════ STAGE 1: TECHNICAL SCORE ══════
         trend_score = self._score_trend(indicators, intraday_indicators)
@@ -212,6 +209,13 @@ class SignalEngine:
             return self._hold(symbol, price, raw_score,
                               f"Confidence {confidence:.2f} below {self.MIN_CONFIDENCE}")
 
+        # Phase-specific confidence floors — power_hour needs high conviction
+        phase_min_conf = {"power_hour": 0.72}
+        phase_floor = phase_min_conf.get(phase, 0.0)
+        if confidence < phase_floor:
+            return self._hold(symbol, price, raw_score,
+                              f"Confidence {confidence:.2f} below {phase} floor {phase_floor}")
+
         # ══════ BUILD DECISION ══════
         reasoning_parts = []
         if detected_setup != SetupType.NO_SETUP:
@@ -271,25 +275,26 @@ class SignalEngine:
         else:
             confluence_component = 0.0
 
-        # 3. Price tier component (0-1, 0.20 weight)
-        # Backtested: $60-150 = 57.5% WR, $150-300 = decent, $30-60 = 30.6% WR
+        # 3. Price tier component (0-1, 0.15 weight)
+        # Slight penalty for cheap stocks, but not a wall
         if 60 <= price <= 150:
             price_component = 1.0   # Sweet spot
         elif 150 < price <= 300:
-            price_component = 0.7   # Still good
+            price_component = 0.8   # Still good
         elif 300 < price <= 500:
-            price_component = 0.5   # Less liquid
+            price_component = 0.6   # Less liquid
         elif 30 <= price < 60:
-            price_component = 0.25  # $30-60 penalized (30.6% WR, -$6,430)
+            price_component = 0.50  # Penalized but not killed
         else:
-            price_component = 0.1   # Sub-$30 or edge cases
+            price_component = 0.2   # Sub-$30 or edge cases
 
         # 4. Phase component (0-1, 0.15 weight)
-        # Prime: 50-60% WR, Open: mixed, Afternoon: BLOCKED (won't reach here)
         phase_map = {
             "prime": 1.0,       # Best phase
-            "power_hour": 0.7,  # Decent
-            "open": 0.4,        # Noisy
+            "power_hour": 0.8,  # Strong moves
+            "open": 0.5,        # Noisy but tradeable
+            "afternoon": 0.6,   # Lower quality but real setups exist
+            "lunch": 0.3,       # Low volume, penalize heavily
         }
         phase_component = phase_map.get(phase, 0.3)
 
@@ -304,11 +309,11 @@ class SignalEngine:
         else:
             risk_component = 0.2   # Too tight or too wide
 
-        # Weighted composite
+        # Weighted composite (rebalanced: tech+confluence dominate, price demoted)
         confidence = (
-            0.35 * tech_component +
+            0.40 * tech_component +
             0.20 * confluence_component +
-            0.20 * price_component +
+            0.15 * price_component +
             0.15 * phase_component +
             0.10 * risk_component
         )
@@ -447,28 +452,26 @@ class SignalEngine:
         gap_pct = price_data.get("change_pct", 0)
 
         # ── ORB Breakout ──
-        # Require price not too extended above OR high (>2% = chasing)
+        # Data: -$17,731 across 8 periods as standalone long setup.
+        # Require Dual Thrust confirmation (multi-day dynamic range) — filters noise breakouts.
+        # Without DT confirmation, ORB only adds a small bonus to other setups.
         or_high = intra.get("or_high")
         dt_upper = levels.get("dt_upper")
+        vol_acc = intra.get("volume_acceleration")
         if intra.get("above_or_high") and or_high and or_high > 0:
             extension_pct = (price_data["price"] - or_high) / or_high * 100
-            if extension_pct <= 2.0:
-                score += 35
+            has_volume = vol_acc is not None and vol_acc >= 1.3
+            # DT-confirmed breakout = real multi-day range break
+            if extension_pct <= 1.5 and has_volume and dt_upper and price_data["price"] >= dt_upper:
+                score += 30
                 setup = SetupType.ORB_BREAKOUT
-                # Dual Thrust confirmation bonus — price exceeds multi-day dynamic range
-                if dt_upper and price_data["price"] >= dt_upper:
-                    score += 8
-                # Volume confirmation bonus (additive, not a gate)
-                vol_acc = intra.get("volume_acceleration")
-                if vol_acc is not None and vol_acc >= 1.5:
-                    score += 5
-            else:
-                score += 10  # Extended breakout, lower conviction
+            elif extension_pct <= 1.5:
+                score += 8  # Unconfirmed ORB — small bonus, not a standalone setup
 
         # ── Gap & Go ── BLOCKED
-        # Data: -$5,889 across 607 trades, 34.9% WR. Volatile names (GME, GTLB,
-        # NVDL) dominate losses. Gap continuation is unreliable intraday.
-        # Do NOT assign score or setup for gap-and-go.
+        # 25-33% WR across all test periods. Engine is momentum/breakout-based;
+        # gap continuation requires different logic (pre-market levels, gap fill analysis).
+        # Do NOT assign score or setup.
 
         # ── VWAP Reclaim ──
         vwap = ind.get("vwap") or intra.get("vwap_5m")
@@ -479,16 +482,15 @@ class SignalEngine:
                 if setup == SetupType.NO_SETUP:
                     setup = SetupType.VWAP_RECLAIM
 
-        # ── Mean Reversion ──
-        bb_lower = ind.get("bb_lower")
-        rsi = ind.get("rsi")
-        if bb_lower and price_data["price"] <= bb_lower and rsi and rsi < 35:
-            score += 30
-            if setup == SetupType.NO_SETUP:
-                setup = SetupType.MEAN_REVERSION
+        # ── Mean Reversion ── BLOCKED
+        # 0-19% WR across all test periods. Engine is momentum/breakout-based;
+        # mean reversion requires different indicators (BB width, RSI divergence,
+        # volume exhaustion) that the scoring model doesn't properly capture.
+        # Do NOT assign score or setup.
 
         # ── Oversold Bounce ──
-        if rsi and rsi < 30:
+        rsi = ind.get("rsi")
+        if rsi and rsi < 35:
             support_levels = levels.get("support_levels", [])
             for s in support_levels[:2]:
                 if abs(price_data["price"] - s) / price_data["price"] < 0.01:
@@ -497,8 +499,7 @@ class SignalEngine:
                     break
 
         # ── First Pullback ── BLOCKED
-        # Data: 0/10+ trades across 4 test periods, -$1,100+ total.
-        # Detection logic in patterns.py is too loose — catches false pullbacks.
+        # 0% WR across multiple test periods — detection is fundamentally broken.
         # Do NOT assign score or setup.
 
         # ── HOD Break ──
@@ -527,15 +528,18 @@ class SignalEngine:
         if "shooting_star" in patterns_text.lower():
             score -= 12
 
-        # ── Momentum continuation ──
-        # Data: 29.2% WR, -$834 when used as primary setup. Strong as confirmation.
+        # ── Momentum / Trend Continuation ──
+        # Standalone momentum was weak (29% WR) with old thresholds.
+        # With tighter filters (confidence model, phase floors), allow as
+        # "Trend Continuation" when multiple factors confirm:
+        # EMA bullish + above VWAP + decent volume = riding the trend
         ema_bull = intra.get("ema_bullish_5m")
         above_vwap = intra.get("above_vwap_5m")
-        if ema_bull and above_vwap and gap_pct > 1.0:
-            if setup == SetupType.NO_SETUP:
-                pass  # Blocked as standalone — 25% WR, -$997 across 4 periods
-            else:
-                score += 15  # Strong as confirmation of existing pattern
+        if ema_bull and above_vwap:
+            if setup != SetupType.NO_SETUP:
+                score += 15  # Confirmation bonus for existing pattern
+            # Standalone momentum continuation blocked for longs — 38.5% WR.
+            # Structurally: "it's going up" isn't an entry trigger without a setup.
 
         return max(0, min(100, score)), setup
 
