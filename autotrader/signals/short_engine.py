@@ -28,6 +28,7 @@ class ShortSetupType(Enum):
     LOD_BREAK = "LOD Break"
     EXHAUSTION_SHORT = "Exhaustion Short"
     MOMENTUM_BREAKDOWN = "Momentum Breakdown"
+    GREEN_TO_RED = "Green to Red"
     NO_SETUP = "No Setup"
 
 
@@ -97,7 +98,7 @@ class ShortSignalEngine:
         if price < self.MIN_PRICE or price > self.MAX_PRICE:
             return self._hold(symbol, price, 0, f"Price ${price:.0f} outside range")
 
-        # Phase gate — afternoon negative in 6/8 test periods
+        # Phase gate — lunch + afternoon blocked (structural low volume, choppy).
         if phase in ("close", "premarket", "lunch", "afternoon"):
             return self._hold(symbol, price, 0, f"Phase {phase} blocked")
 
@@ -468,6 +469,28 @@ class ShortSignalEngine:
         if "evening_star" in patterns_text.lower():
             score += 12
 
+        # ── Green to Red ──
+        # Stock opened above prior close (green), dropped below it (red) with volume.
+        # Structural: mirror of Red-to-Green for longs. Prior close reclaim failure = buyers trapped.
+        # Already detected by patterns.py — wire it with volume confirmation.
+        prior_close = levels.get("prior_day_close")
+        if prior_close and "green_to_red" in patterns_text.lower():
+            extension = (prior_close - price) / prior_close * 100 if prior_close > 0 else 99
+            has_volume = vol_acc is not None and vol_acc >= 1.2
+            if 0 < extension < 1.0 and has_volume:
+                score += 25
+                if setup == ShortSetupType.NO_SETUP:
+                    setup = ShortSetupType.GREEN_TO_RED
+
+        # Three Black Crows — strong bearish momentum confirmation
+        if "three_black_crows" in patterns_text.lower():
+            score += 12
+
+        # Inside Bar — bearish breakout when trend context is bearish
+        if "inside_bar" in patterns_text.lower() and "bearish" in patterns_text.lower():
+            if intra.get("ema_bullish_5m") is False:
+                score += 8
+
         # Penalty for bullish patterns (bad for shorts)
         if "bullish_engulfing" in patterns_text.lower():
             score -= 15
@@ -574,6 +597,12 @@ class ShortSignalEngine:
             vwap = levels.get("vwap") or ind.get("vwap") or ind.get("vwap_5m")
             if vwap and vwap > price:
                 structural_stop = vwap * (1 + self.STOP_BUFFER_PCT)
+
+        # Green to Red: stop above prior close
+        if setup == ShortSetupType.GREEN_TO_RED:
+            prior_close = levels.get("prior_day_close")
+            if prior_close and prior_close > price:
+                structural_stop = prior_close * (1 + self.STOP_BUFFER_PCT)
 
         # Use the tighter stop (lower value, since stop is above entry)
         stop = min(structural_stop, atr_stop)

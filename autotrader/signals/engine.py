@@ -25,6 +25,8 @@ class SetupType(Enum):
     GAP_AND_GO = "Gap & Go"
     HOD_BREAK = "HOD Break"
     OVERSOLD_BOUNCE = "Oversold Bounce"
+    RED_TO_GREEN = "Red to Green"
+    PDH_RECLAIM = "PDH Reclaim"
     NO_SETUP = "No Setup"
 
 
@@ -114,7 +116,8 @@ class SignalEngine:
             return self._hold(symbol, price, 0, f"Price ${price:.0f} above ${self.MAX_PRICE} maximum")
 
         # ══════ PHASE GATE ══════
-        # Afternoon: negative in 6/8 test periods (-$7,000+ total). Low volume, choppy action.
+        # Lunch + afternoon blocked: structural low volume, choppy action (38.5% WR).
+        # Tested with adaptive time stops — still -$2,600 on 96 trades. Structural issue.
         if phase in ("close", "premarket", "lunch", "afternoon"):
             return self._hold(symbol, price, 0, f"Phase {phase} blocked")
 
@@ -482,6 +485,34 @@ class SignalEngine:
                 if setup == SetupType.NO_SETUP:
                     setup = SetupType.VWAP_RECLAIM
 
+        # ── Red to Green ──
+        # Stock opened red (below prior close) and has reclaimed prior close.
+        # Structural: gap fills are well-documented; reclaiming prior close = overnight sellers absorbed.
+        # Already detected by patterns.py — wire it with volume confirmation.
+        prior_close = levels.get("prior_day_close")
+        if prior_close and "red_to_green" in patterns_text.lower():
+            extension = (price_data["price"] - prior_close) / prior_close * 100 if prior_close > 0 else 99
+            has_volume = vol_acc is not None and vol_acc >= 1.2
+            if 0 < extension < 1.0 and has_volume:
+                score += 25
+                if setup == SetupType.NO_SETUP:
+                    setup = SetupType.RED_TO_GREEN
+
+        # ── Prior Day High Reclaim ──
+        # Price opened below PDH and broke above it with volume + momentum.
+        # Structural: PDH is the #1 institutional level. Mirror of shorts' LOD Break.
+        # Already detected by patterns.py — wire it with confluence filters.
+        pdh = levels.get("prior_day_high")
+        if pdh and "prior_day_high_break" in patterns_text.lower():
+            opened_below = price_data.get("open", 0) < pdh
+            extension = (price_data["price"] - pdh) / pdh * 100 if pdh > 0 else 99
+            has_volume = vol_acc is not None and vol_acc >= 1.2
+            ema_bull = intra.get("ema_bullish_5m")
+            if opened_below and 0 < extension < 1.5 and has_volume and ema_bull:
+                score += 25
+                if setup == SetupType.NO_SETUP:
+                    setup = SetupType.PDH_RECLAIM
+
         # ── Mean Reversion ── BLOCKED
         # 0-19% WR across all test periods. Engine is momentum/breakout-based;
         # mean reversion requires different indicators (BB width, RSI divergence,
@@ -521,6 +552,15 @@ class SignalEngine:
             score += 12
         if "hammer" in patterns_text.lower():
             score += 10
+
+        # Three White Soldiers — strong bullish momentum confirmation
+        if "three_white_soldiers" in patterns_text.lower():
+            score += 12
+
+        # Inside Bar — bullish breakout when trend context is bullish
+        if "inside_bar" in patterns_text.lower() and "bullish" in patterns_text.lower():
+            if intra.get("ema_bullish_5m"):
+                score += 8
 
         # Penalty for bearish patterns
         if "bearish_engulfing" in patterns_text.lower():
@@ -625,6 +665,16 @@ class SignalEngine:
             vwap = levels.get("vwap") or ind.get("vwap") or ind.get("vwap_5m")
             if vwap and vwap < price:
                 structural_stop = vwap * (1 - self.STOP_BUFFER_PCT)
+
+        if setup == SetupType.RED_TO_GREEN:
+            prior_close = levels.get("prior_day_close")
+            if prior_close and prior_close < price:
+                structural_stop = prior_close * (1 - self.STOP_BUFFER_PCT)
+
+        if setup == SetupType.PDH_RECLAIM:
+            pdh = levels.get("prior_day_high")
+            if pdh and pdh < price:
+                structural_stop = pdh * (1 - self.STOP_BUFFER_PCT)
 
         stop = max(structural_stop, atr_stop)
         stop = max(stop, price * 0.95)

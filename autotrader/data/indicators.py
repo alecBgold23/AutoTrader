@@ -198,6 +198,15 @@ def calculate_intraday_indicators(df_5m: pd.DataFrame) -> dict:
                 result["below_or_low"] = current < opening_range_low
                 result["or_breakout"] = current > opening_range_high or current < opening_range_low
 
+        # Session high/low proximity — needed for Failed Breakout detection
+        if today_mask is not None and len(today_data) >= 3:
+            session_high = float(today_data["High"].max())
+            session_low = float(today_data["Low"].min())
+            current = float(close.iloc[-1])
+            # "Was at HOD/LOD" = price within 0.5% of session extreme
+            result["was_at_hod"] = current >= session_high * 0.995
+            result["was_at_lod"] = current <= session_low * 1.005
+
         # Volume trend (last 12 bars = 1 hour)
         if len(volume) >= 12:
             recent_vol = float(volume.iloc[-12:].mean())

@@ -226,10 +226,10 @@ The backtest simulates real market scanning — not a hardcoded stock list:
 5. Applies regime-aware sizing (SPY trend + VIX level from prior close)
 6. Fills buy orders at next bar's open + $0.01/share slippage
 7. Close-based stops (bar close below stop, not wick touching)
-8. Scale-out: 1/2 at 1R (move stop to BE); trailing stop after 1R (1R from high, floor at breakeven)
-9. 30-minute time stop with winner exception: >0.5R gets tight trailing stop, otherwise hard close
+8. Scale-out: 1/3 at 1R (move stop to BE), 1/3 at 2R; trailing stop 0.5R from high, floor at breakeven
+9. Adaptive time stops: 45-min losers with MFE ≥ 0.3% get BE lock instead of hard close; 90-min hard close only if underwater; winners trail until stopped or EOD
 10. Time exits: half at 30 min to close, full at 15 min, force-close at 3:50 PM ET
-11. Lunch phase (11 AM - 1:30 PM ET) blocked from new entries (structural: low volume, wide spreads)
+11. Lunch + afternoon phases blocked from new entries (structural: low volume, choppy action)
 12. Enforces all risk limits: 2% daily loss halt, 3-loss cooldown, sector concentration, 80% max exposure
 
 ### Backtest-Specific Risk Parameters
@@ -263,28 +263,38 @@ These are tuned separately from live (pending sync after validation):
 ./venv/bin/python -m autotrader.backtest.runner --start 2024-12-02 --end 2025-02-28 --model claude-sonnet-4-20250514
 ```
 
-### Latest Results (Apr 2026, deterministic SignalEngine + death zone block + DT bonus)
+### Latest Results (Apr 2026, deterministic engines + adaptive time stops + new signal patterns)
 
 Uses deterministic SignalEngine + ShortSignalEngine (no Claude API calls). Key improvements:
-- Long confidence death zone (0.80-0.85) blocked — 28% WR, structural trap
-- Dual Thrust dynamic ORB confirmation bonus (+8 for confirmed breakouts)
-- Short 0.80-0.85 confidence: 50% size reduction (58% WR but thin edge)
+- 0.5R trailing stop (A/B tested: +$1,283 vs 0.7R across 8 periods)
+- **Adaptive time stops**: At 45 min, if a losing position had MFE ≥ 0.3% (was profitable at some point), lock breakeven instead of hard-closing. At 90 min, hard-close only if still underwater; winners trail until stopped or EOD.
+- **New signal patterns**: PDH Reclaim (long), Failed Breakout unblocked via `was_at_hod` bug fix (short), score bonuses for three_white_soldiers/three_black_crows/inside_bar
+- 4x PDT margin (accurate Alpaca modeling, negligible P&L impact)
 
 8 overlapping 3-month periods:
 
-| Period | P&L | Trades | Long WR | Short WR |
-|--------|-----|--------|---------|----------|
-| Apr-Jun 2024 | +$943 | 25 | 59% | 50% |
-| May-Jul 2024 | -$1,467 | 33 | 20% | 44% |
-| Jun-Aug 2024 | +$1,484 | 53 | 32% | 71% |
-| Jul-Sep 2024 | -$222 | 20 | 27% | 44% |
-| Aug-Oct 2024 | +$1,598 | 26 | 46% | 69% |
-| Sep-Nov 2024 | +$1,201 | 28 | 69% | 58% |
-| Oct-Dec 2024 | -$27 | 13 | 40% | 63% |
-| Dec-Feb 2025 | +$279 | 18 | 85% | 0% |
-| **Total** | **+$3,788** | **216** | | |
+| Period | P&L | Trades | WR | PF |
+|--------|-----|--------|----|----|
+| Apr-Jun 2024 | +$13,426 | 246 | 60.6% | 1.96 |
+| May-Jul 2024 | +$2,127 | 238 | 49.2% | 1.12 |
+| Jun-Aug 2024 | +$17,730 | 314 | 62.4% | 1.87 |
+| Jul-Sep 2024 | +$14,666 | 197 | 68.0% | 2.30 |
+| Aug-Oct 2024 | +$9,226 | 214 | 61.7% | 1.85 |
+| Sep-Nov 2024 | +$3,176 | 133 | 54.1% | 1.43 |
+| Oct-Dec 2024 | +$4,308 | 86 | 59.3% | 2.24 |
+| Dec-Feb 2025 | +$3,166 | 63 | 60.3% | 1.85 |
+| **Total** | **+$67,825** | **1,491** | | |
 
-**6 of 8 periods profitable** (up from 5/8). Shorts remain the core edge (+$2,146 ORB Breakdown). Death zone block improved total by +$905 vs baseline.
+**All 8 periods profitable.** Average ~$2,826/month (~2.8%/month on $100K). Previous baseline (same yfinance data): +$28,340 total — **+$39,485 improvement (139%)**.
+
+#### Changes tested and rejected (Apr 2026)
+- **Leveraged ETFs** (TQQQ/SOXL/TNA/UPRO/SPXL force-include): -$1,335 net. Amplifies losses as much as gains, drops WR 2%.
+- **Afternoon trading re-enabled**: -$2,124. 38.5% WR on 96 trades even with adaptive stops. Structural low quality.
+- **4x margin alone**: +$94. Buying power is never the binding constraint (risk params are).
+- **BE lock at 0.5R**: Neutral. Protects some blown winners but prematurely stops real winners. Kept at 0.7R.
+- **Scale 1/2 at 1R**: Worse. Reduces runner position too much. Kept at 1/3.
+- **Red to Green** (long pattern): 0/3 trades across 2 periods (0% WR). Detection fires too late — move already extended.
+- **Green to Red** (short pattern): 0/1 trades. Same issue as Red-to-Green — detection fires too late.
 
 **Important caveat:** Results are sensitive to which yfinance daily data is cached. Data downloaded on different dates can produce slightly different adjusted prices, which changes scanner scores and symbol selection. Always establish a fresh baseline before comparing changes.
 
@@ -413,12 +423,12 @@ Claude sees "{trades_today}/8 trades used" and is taught to pace itself.
 ## Known Issues / Not Yet Configured
 
 - **Deterministic mode** — System uses SignalEngine + ShortSignalEngine for all decisions. No Claude API calls needed. Claude cache is unused in deterministic mode.
-- **Live ≈ Backtest parameters** — Live now uses same risk params (5% per trade, 15% max position, 80% exposure), same signal engines (long + short), same position management (1/2 at 1R, trailing stop). Minor differences: live uses broker-side stops (GTC) for crash protection; backtest uses simulated close-based stops.
+- **Live ≈ Backtest parameters** — Live now uses same risk params (5% per trade, 15% max position, 80% exposure), same signal engines (long + short), same position management (1/3 at 1R, 1/3 at 2R, 0.5R trailing stop). Minor differences: live uses broker-side stops (GTC) for crash protection; backtest uses simulated close-based stops. **Pending sync to live**: adaptive time stops (MFE-based BE lock), MFE tracking in live PositionManager, new signal patterns (PDH Reclaim, Failed Breakout was_at_hod fix, pattern bonuses).
 - **Long engine selectivity** — Long MIN_SCORE raised to 65 (vs short's 62). Long confidence death zone (0.80-0.85) completely blocked: 28% WR, -$1,592 across 53 trades. Short death zone kept at 50% size reduction (58% WR, neutral P&L).
 - **Dual Thrust dynamic range** — `calculate_dual_thrust_range()` in indicators.py computes adaptive ORB thresholds from 5-day price action. Confirmed ORB breakouts (exceeding DT level) get +8 score bonus. Infrastructure available for future use as standalone setup.
 - **launchd import error** — `alpaca.data.news.NewsClient` module not found on launchd restart. The Friday process (manual `run.py`) works fine. Need to fix the launchd plist Python/venv path.
 - **Telegram** not configured — alerts are silently skipped
-- **Shorting enabled in both live and backtest** — `ShortSignalEngine` (`signals/short_engine.py`) integrated into both `backtest/engine.py` and `main.py` with direction-aware P&L, stops, scale-outs, trailing stops, and broker stop orders. Patterns: ORB Breakdown, VWAP Rejection, Bear Flag, LOD Break. Gap & Fade blocked. Controlled via `ENABLE_SHORT` in `config.py`.
+- **Shorting enabled in both live and backtest** — `ShortSignalEngine` (`signals/short_engine.py`) integrated into both `backtest/engine.py` and `main.py` with direction-aware P&L, stops, scale-outs, trailing stops, and broker stop orders. Patterns: ORB Breakdown, VWAP Rejection, Bear Flag, LOD Break, Failed Breakout (via was_at_hod). Gap & Fade, Green-to-Red blocked. Score bonuses: three_black_crows (+12), inside_bar bearish (+8). Controlled via `ENABLE_SHORT` in `config.py`.
 - **Scanner uses yfinance batch downloads** — Can be slow on initial universe build (~2-3 min for 800 stocks)
 - **Backtest results not reproducible across sessions** — yfinance adjusts historical prices over time. Daily data cached on different dates produces different scanner scores and symbol selection.
 
