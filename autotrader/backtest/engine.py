@@ -1190,6 +1190,16 @@ class BacktestEngine:
 
             # ═══ DIRECTIONAL POSITION MANAGEMENT ═══
 
+            # 0. Early BE lock for shorts when MFE >= 0.3%
+            # Structural: down moves are 1.5-2x faster than up moves and reverse
+            # quickly. Once a short confirms the thesis (0.3% profit), protect it
+            # immediately rather than waiting for the 45-min checkpoint or 0.7R.
+            # Source: every verified short seller (Temiz, Grittani, Michaud, Madaz)
+            # emphasizes quick profit protection — "cover into the panic."
+            if is_short and not pos.breakeven_locked and pos.mfe >= 0.3:
+                pos.current_stop = min(pos.entry_price, pos.current_stop)
+                pos.breakeven_locked = True
+
             # 1. Breakeven lock at +0.7R
             if not pos.breakeven_locked and current_r >= 0.7:
                 if is_short:
@@ -1290,9 +1300,13 @@ class BacktestEngine:
                     self._close_position(sym, exit_price, current_time, "Time stop (45min loser)")
                     continue
 
-            # 5. Trailing stop (direction-aware) — 0.5R trail (A/B tested: +$1,283 across 8 periods vs 0.7R)
+            # 5. Trailing stop (direction-aware)
+            # Shorts: 0.3R trail — down moves are faster and reverse more violently.
+            # Tighter trail captures more of the fast move. 54% of short losers had
+            # >0.3% MFE — the 0.5R trail was letting confirmed profits evaporate.
+            # Longs: 0.5R trail (A/B tested: +$1,283 across 8 periods vs 0.7R)
             if pos.breakeven_locked:
-                trail_distance = 0.5 * pos.risk_per_share
+                trail_distance = (0.3 if is_short else 0.5) * pos.risk_per_share
                 if is_short:
                     trail_stop = pos.lowest_price + trail_distance
                     trail_stop = min(trail_stop, pos.entry_price)

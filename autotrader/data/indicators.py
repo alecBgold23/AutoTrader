@@ -137,6 +137,25 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
             "prev_close": round(float(close.iloc[-2]), 2) if len(close) > 1 else None,
         }
 
+        # Multi-day runner detection — needed for First Red Day short pattern.
+        # Counts consecutive green days (close > open) going backward from the
+        # most recent completed day (iloc[-2], since iloc[-1] is today/partial).
+        # Also computes total % run over those green days.
+        consecutive_green = 0
+        for j in range(len(df) - 2, -1, -1):
+            if float(close.iloc[j]) > float(df["Open"].iloc[j]):
+                consecutive_green += 1
+            else:
+                break
+        result["consecutive_green_days"] = consecutive_green
+        if consecutive_green >= 2:
+            run_start_idx = max(0, len(df) - 2 - consecutive_green)
+            run_start_price = float(close.iloc[run_start_idx])
+            if run_start_price > 0:
+                result["multi_day_run_pct"] = round(
+                    (float(close.iloc[-2]) - run_start_price) / run_start_price * 100, 2
+                )
+
         return result
 
     except Exception as e:

@@ -3,14 +3,18 @@
 Completely independent from the long engine. Designed to be tested in isolation
 first, then merged into the main system only if consistently profitable.
 
-Key short patterns:
-- Gap & Fade: Gap-up stocks that fail to hold → sell the trap
+Patterns based on verified successful short sellers' systems:
+- First Red Day: Multi-day runner exhausts, short first red day (Temiz, Williams)
+- Exhaustion Short: Overbought stock confirms reversal on backside (Michaud, Madaz)
+- VWAP Rejection: Failed reclaim of VWAP from below (SMB Capital)
 - ORB Breakdown: Price breaks below opening range low
-- VWAP Rejection: Failed reclaim of VWAP from below
+- PDL Break: Breaking below prior day's low with volume
 - Bear Flag: Consolidation after a drop, then continuation
 - Failed Breakout: Breaks above resistance then reverses below it
 - LOD Break: Breaking below low of day with volume
-- Exhaustion Short: Parabolic move up on declining volume + reversal candle
+- Green to Red: Opened green, dropped below prior close with volume (Grittani)
+- Momentum Breakdown: Bearish trend continuation with volume
+- Gap & Fade: BLOCKED (11.1% WR — fading gaps fights strongest momentum)
 """
 
 import numpy as np
@@ -27,6 +31,9 @@ class ShortSetupType(Enum):
     FAILED_BREAKOUT = "Failed Breakout"
     LOD_BREAK = "LOD Break"
     EXHAUSTION_SHORT = "Exhaustion Short"
+    FIRST_RED_DAY = "First Red Day"
+    MORNING_POP_FADE = "Morning Pop Fade"
+    PDL_BREAK = "PDL Break"
     MOMENTUM_BREAKDOWN = "Momentum Breakdown"
     GREEN_TO_RED = "Green to Red"
     NO_SETUP = "No Setup"
@@ -469,11 +476,81 @@ class ShortSignalEngine:
         if "evening_star" in patterns_text.lower():
             score += 12
 
+        # ── Morning Pop Fade (Madaz/Grittani) ──
+        # Stock spikes at the open (intraday high > 2% above open), then the pop
+        # fails and price drops back below the opening price. Structural basis:
+        # retail FOMO buyers pile in at the open creating the "pop"; when it fails,
+        # those buyers become immediate sellers (panic), creating a reliable fade.
+        # Source: Madaz ($4.17M in 7 months, 93% WR), Tim Grittani ($13.5M).
+        today_open = price_data.get("open", 0)
+        session_high = price_data.get("high", 0)
+        if today_open > 0 and session_high > 0:
+            pop_pct = (session_high - today_open) / today_open * 100
+            now_below_open = price < today_open
+            has_volume = vol_acc is not None and vol_acc >= 1.2
+            ema_bearish = intra.get("ema_bullish_5m") is False
+            if pop_pct >= 2.0 and now_below_open and has_volume and ema_bearish:
+                score += 25
+                if setup == ShortSetupType.NO_SETUP:
+                    setup = ShortSetupType.MORNING_POP_FADE
+
+        # ── First Red Day Short (Temiz/Williams) ──
+        # After a multi-day runner (3+ consecutive green days, 10%+ total run),
+        # short on the first day price drops below prior close. Structural basis:
+        # late buyers from the run are trapped, stop-loss cascade begins, short
+        # sellers who were squeezed on the way up re-enter with confirmation.
+        # Source: Alex Temiz ($16M verified via Kinfo), Kyle Williams ($7M).
+        prior_close = levels.get("prior_day_close")
+        consecutive_green = ind.get("consecutive_green_days", 0)
+        multi_day_run = ind.get("multi_day_run_pct", 0)
+        if (prior_close and price < prior_close
+                and consecutive_green >= 3
+                and multi_day_run >= 10):
+            has_volume = vol_acc is not None and vol_acc >= 1.2
+            if has_volume:
+                score += 25
+                if setup == ShortSetupType.NO_SETUP:
+                    setup = ShortSetupType.FIRST_RED_DAY
+
+        # ── Exhaustion Short / Parabolic Backside (Michaud/Madaz) ──
+        # Stock is overbought (daily RSI > 70) and showing intraday reversal
+        # confirmation: 5m trend turned bearish + price below VWAP. Structural
+        # basis: parabolic moves are unsustainable — by waiting for the backside
+        # (reversal confirmation), you avoid squeeze risk. NEVER short the front
+        # side. Source: Nathan Michaud (22yr career, Investors Underground),
+        # Madaz ($4.17M in 7 months, Kinfo verified).
+        rsi_daily = ind.get("rsi")
+        ema_bearish_5m = intra.get("ema_bullish_5m") is False
+        below_vwap = intra.get("above_vwap_5m") is False
+        if (rsi_daily is not None and rsi_daily > 70
+                and ema_bearish_5m and below_vwap):
+            # Bonus for bearish candle confirmation (shooting star, bearish engulfing, evening star)
+            has_candle = any(p in patterns_text.lower() for p in
+                            ["shooting_star", "bearish_engulfing", "evening_star"])
+            score += 25
+            if has_candle:
+                score += 8  # Candle confirmation adds conviction
+            if setup == ShortSetupType.NO_SETUP:
+                setup = ShortSetupType.EXHAUSTION_SHORT
+
+        # ── Prior Day Low Break (PDL Break) ──
+        # Price breaks below prior day's low with volume. Structural basis:
+        # PDL is a key institutional level — the mirror of PDH Reclaim for longs.
+        # Breaking below it triggers stop-loss cascades from overnight holders.
+        # Already detected by patterns.py as "prior_day_low_break".
+        pdl = levels.get("prior_day_low")
+        if pdl and "prior_day_low_break" in patterns_text.lower():
+            extension = (pdl - price) / pdl * 100 if pdl > 0 else 99
+            has_volume = vol_acc is not None and vol_acc >= 1.2
+            if 0 < extension < 1.5 and has_volume:
+                score += 20
+                if setup == ShortSetupType.NO_SETUP:
+                    setup = ShortSetupType.PDL_BREAK
+
         # ── Green to Red ──
         # Stock opened above prior close (green), dropped below it (red) with volume.
         # Structural: mirror of Red-to-Green for longs. Prior close reclaim failure = buyers trapped.
         # Already detected by patterns.py — wire it with volume confirmation.
-        prior_close = levels.get("prior_day_close")
         if prior_close and "green_to_red" in patterns_text.lower():
             extension = (prior_close - price) / prior_close * 100 if prior_close > 0 else 99
             has_volume = vol_acc is not None and vol_acc >= 1.2
@@ -597,6 +674,37 @@ class ShortSignalEngine:
             vwap = levels.get("vwap") or ind.get("vwap") or ind.get("vwap_5m")
             if vwap and vwap > price:
                 structural_stop = vwap * (1 + self.STOP_BUFFER_PCT)
+
+        # Morning Pop Fade: stop above today's open (the pop start level).
+        # If price reclaims the open after the pop failed, the fade thesis is dead.
+        # Source: Madaz, Grittani — the open is the invalidation level.
+        if setup == ShortSetupType.MORNING_POP_FADE:
+            today_open = levels.get("today_open")
+            if today_open and today_open > price:
+                structural_stop = today_open * (1 + self.STOP_BUFFER_PCT)
+
+        # First Red Day: stop above prior day's close (the red/green inflection point).
+        # If price reclaims prior close and holds, the thesis is dead.
+        # Source: Temiz, Williams — prior close reclaim = hard stop.
+        if setup == ShortSetupType.FIRST_RED_DAY:
+            prior_close = levels.get("prior_day_close")
+            if prior_close and prior_close > price:
+                structural_stop = prior_close * (1 + self.STOP_BUFFER_PCT)
+
+        # Exhaustion Short: stop above VWAP (institutional fair value).
+        # If price reclaims VWAP after showing reversal, sellers aren't in control.
+        # Source: Michaud — VWAP as risk guide for parabolic backside shorts.
+        if setup == ShortSetupType.EXHAUSTION_SHORT:
+            vwap = levels.get("vwap") or ind.get("vwap") or ind.get("vwap_5m")
+            if vwap and vwap > price:
+                structural_stop = vwap * (1 + self.STOP_BUFFER_PCT)
+
+        # PDL Break: stop above prior day's low (the level that was broken).
+        # If price reclaims PDL, the breakdown failed — get out.
+        if setup == ShortSetupType.PDL_BREAK:
+            pdl = levels.get("prior_day_low")
+            if pdl and pdl > price:
+                structural_stop = pdl * (1 + self.STOP_BUFFER_PCT)
 
         # Green to Red: stop above prior close
         if setup == ShortSetupType.GREEN_TO_RED:
