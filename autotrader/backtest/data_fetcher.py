@@ -289,6 +289,167 @@ def fetch_daily_bars_batch(symbols: list[str], start_date: str, end_date: str) -
     return result
 
 
+def fetch_daily_bars_batch_alpaca(
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, pd.DataFrame]:
+    """Batch-fetch daily bars for many symbols via Alpaca's historical data API.
+
+    Much faster and more reliable than yfinance for bulk fetches (no rate-limit
+    throttling, deterministic split-adjusted data, no silent failures).
+
+    Uses adjustment='all' (split + dividend) so values are comparable across time,
+    matching the semantics yfinance provides via Adj Close.
+
+    Caches each symbol individually as {SYM}_{START}_{END}_1d_alp.csv — a distinct
+    suffix from yfinance-sourced _1d.csv so the two data sources cannot be mixed
+    within a single run.
+    """
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+    start_str = start_date.replace("-", "")
+    end_str = end_date.replace("-", "")
+
+    def _alp_cache_path(sym: str) -> Path:
+        return CACHE_DIR / f"{sym}_{start_str}_{end_str}_1d_alp.csv"
+
+    result: dict[str, pd.DataFrame] = {}
+    uncached: list[str] = []
+
+    for sym in symbols:
+        cache_file = _alp_cache_path(sym)
+        if cache_file.exists():
+            try:
+                df = _read_cached_csv(cache_file)
+                if not df.empty:
+                    result[sym] = df
+                    continue
+            except Exception:
+                pass
+        uncached.append(sym)
+
+    if not uncached:
+        logger.info(f"Alpaca daily-bar cache hit for all {len(symbols)} symbols")
+        return result
+
+    logger.info(f"Alpaca daily-bar batch fetch: {len(uncached)} uncached / {len(symbols)} total")
+
+    # Need ~250 calendar days of lookback for SMA(200) and other long indicators.
+    start_dt = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=250)).replace(tzinfo=timezone.utc)
+    end_dt = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=5)).replace(tzinfo=timezone.utc)
+
+    client = _get_alpaca_data_client()
+    tf_day = TimeFrame(1, TimeFrameUnit.Day)
+
+    # Try to use the Adjustment enum (preferred); fall back to string if unavailable.
+    adjustment_val = "all"
+    try:
+        from alpaca.data.enums import Adjustment  # type: ignore
+        adjustment_val = Adjustment.ALL
+    except Exception:
+        pass
+
+    batch_size = 500
+    retry_backoffs = [5.0, 15.0, 30.0]
+    batches_ok = 0
+    batches_failed = 0
+
+    for i in range(0, len(uncached), batch_size):
+        batch = uncached[i:i + batch_size]
+        df_batch = None
+        last_err: Exception | None = None
+
+        for attempt in range(len(retry_backoffs) + 1):
+            if attempt > 0:
+                import time
+                time.sleep(retry_backoffs[attempt - 1])
+            try:
+                request = StockBarsRequest(
+                    symbol_or_symbols=batch,
+                    timeframe=tf_day,
+                    start=start_dt,
+                    end=end_dt,
+                    adjustment=adjustment_val,
+                )
+                bars = client.get_stock_bars(request)
+                df_batch = bars.df
+                break
+            except Exception as e:
+                last_err = e
+                continue
+
+        if df_batch is None:
+            batches_failed += 1
+            logger.warning(f"Alpaca daily batch {i // batch_size + 1} failed after retries: {last_err}")
+            continue
+
+        if df_batch.empty:
+            batches_failed += 1
+            logger.warning(f"Alpaca daily batch {i // batch_size + 1} returned empty")
+            continue
+
+        batches_ok += 1
+
+        # MultiIndex is (symbol, timestamp); split per symbol, normalize, cache.
+        try:
+            level_0 = df_batch.index.get_level_values(0)
+        except Exception:
+            level_0 = []
+
+        unique_syms = set(level_0) if len(level_0) else set()
+
+        for sym in batch:
+            if sym not in unique_syms:
+                continue
+            try:
+                sym_df = df_batch.loc[sym]
+
+                col_map = {}
+                for col in sym_df.columns:
+                    cl = col.lower() if isinstance(col, str) else str(col).lower()
+                    if "open" in cl:
+                        col_map[col] = "Open"
+                    elif "high" in cl:
+                        col_map[col] = "High"
+                    elif "low" in cl:
+                        col_map[col] = "Low"
+                    elif "close" in cl:
+                        col_map[col] = "Close"
+                    elif "volume" in cl:
+                        col_map[col] = "Volume"
+                sym_df = sym_df.rename(columns=col_map)
+                keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in sym_df.columns]
+                sym_df = sym_df[keep].dropna(how="all")
+                if sym_df.empty:
+                    continue
+
+                # Atomic cache write
+                cache_file = _alp_cache_path(sym)
+                tmp = cache_file.with_suffix(".csv.tmp")
+                try:
+                    sym_df.to_csv(tmp)
+                    tmp.replace(cache_file)
+                except Exception:
+                    pass
+                result[sym] = sym_df
+            except Exception:
+                continue
+
+        logger.info(
+            f"  Alpaca daily batch {i // batch_size + 1}/"
+            f"{(len(uncached) + batch_size - 1) // batch_size}: "
+            f"{len(result)}/{len(symbols)} symbols loaded"
+        )
+
+    logger.info(
+        f"Alpaca daily-bar fetch complete: {len(result)}/{len(symbols)} loaded "
+        f"(batches ok={batches_ok} failed={batches_failed})"
+    )
+    return result
+
+
 def get_trading_days(start_date: str, end_date: str) -> list[datetime]:
     """Get list of trading days in range using SPY data as reference."""
     # Try cached SPY daily first to avoid yfinance rate limits

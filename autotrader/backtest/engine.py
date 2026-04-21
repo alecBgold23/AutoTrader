@@ -65,7 +65,7 @@ BACKTEST_RISK = {
     "max_position_pct": 0.45,             # 45% max single position (confidence cap is the real limit)
     "max_position_long_pct": 0.20,        # 20% max for longs (reduced — weak direction)
     "max_position_short_pct": 0.45,       # 45% max for shorts (confidence cap governs)
-    "max_total_exposure_pct": 0.90,       # 90% deployed at once
+    "max_total_exposure_pct": 1.575,      # PHASE D2: 1.75x leverage bump (was 0.90) — push within 10% DD hard limit
     "max_trades_per_day": 25,             # Room for 20+ trades
     "min_risk_reward_ratio": 1.5,         # Slightly relaxed from 2:1
     "min_confidence_to_trade": 0.65,      # Raised from 0.50 — data shows <0.65 degrades PF
@@ -210,11 +210,11 @@ def _confidence_position_cap(confidence: float, direction: str = "long") -> floa
 
     Uses the same smooth curve as risk scaling — no arbitrary breakpoints.
     """
-    # Scale cap from 10% to 50% of equity based on confidence
+    # Scale cap from 17.5% to 87.5% of equity based on confidence (PHASE D2: 1.75x bump)
     c = max(0.65, min(1.0, confidence))
     normalized = (c - 0.65) / 0.35
     scale = 0.30 + 0.70 * (normalized ** 1.2)  # Same curve as risk scale
-    return 0.10 + 0.40 * scale  # 10% floor, 50% ceiling
+    return 0.175 + 0.70 * scale  # PHASE D2: 17.5% floor, 87.5% ceiling (was 10% / 50%)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -497,8 +497,8 @@ class BacktestEngine:
                 - trading_days, spy_daily, vix_daily, daily_bars, bars_5m, daily_hot_lists
         """
         from autotrader.backtest.data_fetcher import (
-            fetch_5m_bars, fetch_daily_bars, fetch_spy_daily,
-            fetch_vix_daily, get_trading_days,
+            fetch_5m_bars, fetch_daily_bars, fetch_daily_bars_batch_alpaca,
+            fetch_spy_daily, fetch_vix_daily, get_trading_days,
         )
 
         mode = "DETERMINISTIC" if self.deterministic else f"Claude ({self.model})"
@@ -551,11 +551,11 @@ class BacktestEngine:
 
             logger.info(f"Broad universe: {len(broad_universe)} liquid stocks")
 
-            # 4. Fetch daily bars for the broad universe
-            logger.info(f"Fetching daily data for {len(broad_universe)} symbols...")
-            daily_bars: dict[str, pd.DataFrame] = {}
-            for sym in broad_universe:
-                daily_bars[sym] = fetch_daily_bars(sym, self.start_date, self.end_date)
+            # 4. Fetch daily bars for the broad universe (Alpaca batch — fast + deterministic)
+            logger.info(f"Fetching daily data for {len(broad_universe)} symbols via Alpaca batch...")
+            daily_bars = fetch_daily_bars_batch_alpaca(
+                broad_universe, self.start_date, self.end_date
+            )
             daily_bars = {s: d for s, d in daily_bars.items() if not d.empty}
             logger.info(f"Daily data loaded for {len(daily_bars)} symbols")
 
@@ -1035,6 +1035,7 @@ class BacktestEngine:
                         if trade_direction == "short"
                         else BACKTEST_RISK["max_risk_long_pct"]
                     )
+
                     risk_amount = (
                         self.equity
                         * dir_risk_pct
@@ -1120,17 +1121,39 @@ class BacktestEngine:
                     pos.mfe_time = current_time
 
             # Check stop loss (direction-aware)
+            # Live-realistic CLOSE-TRIGGERED STOP-LIMIT + DEEP-STOP-MARKET model.
+            # Wired in live as: stop-limit at stop with 1.5% limit buffer for
+            # protection vs noise spikes, plus deep stop-market at -1.5% as
+            # catastrophic fallback. Mental check on close confirms before
+            # cancelling/rolling the orders. This matches OLD baseline behavior
+            # (close-trigger, fill at stop level on most bars) while adding the
+            # catastrophic-loss cap for bars where price closes far beyond stop.
+            DEEP_STOP_BUFFER = 0.015   # 1.5% deep market floor
             if is_short:
-                # Short: stop triggers when close goes ABOVE stop
+                # Short: close-trigger (mental check), broker stop-limit fills
                 if bar_close >= pos.current_stop:
-                    exit_price = pos.current_stop + SLIPPAGE_PER_SHARE
-                    self._close_position(sym, exit_price, current_time, "Stop loss hit")
+                    deep_ceiling = pos.current_stop * (1 + DEEP_STOP_BUFFER)
+                    if bar_close <= deep_ceiling:
+                        # Stop-limit fills at stop level (matches OLD baseline)
+                        exit_price = pos.current_stop + SLIPPAGE_PER_SHARE
+                        self._close_position(sym, exit_price, current_time, "Stop-limit hit")
+                    else:
+                        # Catastrophic close — deep stop-market caps loss
+                        exit_price = deep_ceiling + SLIPPAGE_PER_SHARE
+                        self._close_position(sym, exit_price, current_time, "Deep stop-market hit")
                     continue
             else:
-                # Long: stop triggers when close goes BELOW stop
+                # Long: close-trigger (mental check), broker stop-limit fills
                 if bar_close <= pos.current_stop:
-                    exit_price = pos.current_stop - SLIPPAGE_PER_SHARE
-                    self._close_position(sym, exit_price, current_time, "Stop loss hit")
+                    deep_floor = pos.current_stop * (1 - DEEP_STOP_BUFFER)
+                    if bar_close >= deep_floor:
+                        # Stop-limit fills at stop level (matches OLD baseline)
+                        exit_price = pos.current_stop - SLIPPAGE_PER_SHARE
+                        self._close_position(sym, exit_price, current_time, "Stop-limit hit")
+                    else:
+                        # Catastrophic close — deep stop-market caps loss
+                        exit_price = deep_floor - SLIPPAGE_PER_SHARE
+                        self._close_position(sym, exit_price, current_time, "Deep stop-market hit")
                     continue
 
             # Current R (direction-aware)
@@ -1823,61 +1846,135 @@ JSON only:
             logger.warning(f"Alpaca asset list failed: {e}. Using fallback universe.")
             return self._fallback_universe()
 
-        # Filter by price/volume using data from the BACKTEST period (not today)
+        # Filter by price/volume using data from the BACKTEST period (not today).
+        # Deterministic: use exactly WINDOW_TRADING_DAYS business days ending at start_date - 1.
+        #
+        # Data source: Alpaca historical daily bars (NOT yfinance).
+        # Reasons:
+        #   - Alpaca does not revise historical close/volume — reproducible.
+        #   - Alpaca supports bulk symbol queries (list of symbols per request).
+        #   - Documented rate limit (200 req/min free tier) vs yfinance's undocumented
+        #     aggressive throttling that silently corrupted prior universe caches.
+        #   - The backtest already uses Alpaca for 5-minute bars — single source of truth.
         from autotrader.config import SCANNER
-        from datetime import datetime, timedelta
-        # Use the first 10 trading days of the backtest period for filtering
-        filter_start = (datetime.strptime(self.start_date, "%Y-%m-%d") - timedelta(days=14)).strftime("%Y-%m-%d")
-        filter_end = self.start_date
-        logger.info(f"Filtering universe using price/volume data from {filter_start} to {filter_end}")
+        from datetime import datetime, timedelta, timezone
+        import time as _time
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-        universe = []
-        batch_size = 200
+        WINDOW_TRADING_DAYS = 10
+        MIN_DATA_DAYS = 8  # Require 80% coverage of the window
+        BATCH_RETRIES = 3
+        RETRY_BACKOFFS = [5.0, 15.0, 30.0]
+
+        # Build the filter window using business days (excludes weekends; holidays removed by dropna).
+        end_dt = datetime.strptime(self.start_date, "%Y-%m-%d")
+        bdays = pd.bdate_range(end=end_dt - timedelta(days=1), periods=WINDOW_TRADING_DAYS * 2)
+        filter_start_dt = bdays[-WINDOW_TRADING_DAYS].to_pydatetime().replace(tzinfo=timezone.utc)
+        filter_end_dt = end_dt.replace(tzinfo=timezone.utc)
+        logger.info(
+            f"Filtering universe via Alpaca daily bars from {filter_start_dt.date()} to {filter_end_dt.date()} "
+            f"(window={WINDOW_TRADING_DAYS} trading days, min={MIN_DATA_DAYS})"
+        )
+
+        from autotrader.backtest.data_fetcher import _get_alpaca_data_client
+        alp_client = _get_alpaca_data_client()
+        tf_day = TimeFrame(1, TimeFrameUnit.Day)
+
+        universe: list[str] = []
+        universe_stats = {"batches_ok": 0, "batches_failed": 0, "sym_dropped_thin": 0, "sym_error": 0}
+        # Alpaca accepts large symbol lists; 500/batch is well within documented limits.
+        batch_size = 500
+
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i + batch_size]
-            try:
-                data = yf.download(
-                    tickers=batch, start=filter_start, end=filter_end,
-                    interval="1d", progress=False, threads=True,
-                )
-                if data.empty:
-                    continue
-                for sym in batch:
-                    try:
-                        if len(batch) == 1:
-                            close = data["Close"]
-                            vol = data["Volume"]
-                        else:
-                            close = data["Close"][sym] if sym in data["Close"].columns else None
-                            vol = data["Volume"][sym] if sym in data["Volume"].columns else None
-                        if close is None or vol is None:
-                            continue
-                        close = close.dropna()
-                        vol = vol.dropna()
-                        if len(close) < 3:
-                            continue
-                        price = float(close.iloc[-1])
-                        avg_vol = float(vol.mean())
-                        if SCANNER["min_price"] <= price <= SCANNER["max_price"] and avg_vol >= SCANNER["min_avg_volume"]:
-                            universe.append(sym)
-                    except Exception:
-                        continue
-            except Exception:
-                continue
 
-            # No cap — scan the full market, just like live
-            if (i // batch_size) % 5 == 0 and i > 0:
+            # Retry batch with backoff — Alpaca's rate limits are well-defined (200 req/min).
+            df = None
+            for attempt in range(BATCH_RETRIES):
+                try:
+                    request = StockBarsRequest(
+                        symbol_or_symbols=batch,
+                        timeframe=tf_day,
+                        start=filter_start_dt,
+                        end=filter_end_dt,
+                    )
+                    bars = alp_client.get_stock_bars(request)
+                    df = bars.df  # MultiIndex: (symbol, timestamp)
+                    break
+                except Exception as e:
+                    if attempt == BATCH_RETRIES - 1:
+                        logger.warning(f"  Batch {i//batch_size} failed after {BATCH_RETRIES} retries: {e}")
+                        df = None
+                        universe_stats["batches_failed"] += 1
+                    else:
+                        sleep_s = RETRY_BACKOFFS[min(attempt, len(RETRY_BACKOFFS) - 1)]
+                        logger.info(f"  Batch {i//batch_size} attempt {attempt+1} failed; backing off {sleep_s}s")
+                        _time.sleep(sleep_s)
+
+            if df is None or df.empty:
+                if df is not None:  # empty df, not exception
+                    universe_stats["batches_ok"] += 1
+                continue
+            universe_stats["batches_ok"] += 1
+
+            # df has MultiIndex (symbol, timestamp); iterate each symbol's rows.
+            try:
+                symbols_in_df = df.index.get_level_values(0).unique()
+            except Exception:
+                symbols_in_df = []
+
+            for sym in symbols_in_df:
+                try:
+                    sym_df = df.loc[sym]
+                    close = sym_df["close"].dropna()
+                    vol = sym_df["volume"].dropna()
+                    if len(close) < MIN_DATA_DAYS:
+                        universe_stats["sym_dropped_thin"] += 1
+                        continue
+                    price = float(close.iloc[-1])
+                    avg_vol = float(vol.mean())
+                    if (SCANNER["min_price"] <= price <= SCANNER["max_price"]
+                            and avg_vol >= SCANNER["min_avg_volume"]):
+                        universe.append(sym)
+                except Exception:
+                    universe_stats["sym_error"] += 1
+                    continue
+
+            # Track symbols in the batch that Alpaca returned NO data for (delisted / non-existent).
+            missing = set(batch) - set(symbols_in_df)
+            universe_stats["sym_dropped_thin"] += len(missing)
+
+            if (i // batch_size) % 3 == 0 and i > 0:
                 logger.info(f"  Scanned {i}/{len(symbols)} symbols, {len(universe)} qualify so far...")
 
-        # Cache for future runs
+        # Sort for deterministic cache file content (same universe → identical file bytes).
+        universe.sort()
+
+        # Fail loudly if too many batches failed — an incomplete universe biases everything.
+        total_batches = universe_stats["batches_ok"] + universe_stats["batches_failed"]
+        if total_batches > 0 and universe_stats["batches_failed"] / total_batches > 0.1:
+            logger.error(
+                f"Universe build incomplete: {universe_stats['batches_failed']}/{total_batches} "
+                f"batches failed. Not caching. Rerun when network is stable."
+            )
+            return universe  # Return what we have but do NOT cache the incomplete result.
+
+        # Atomic cache write — avoid half-written files if interrupted.
         try:
             import json as _json
-            with open(cache_file, "w") as f:
+            tmp = cache_file.with_suffix(".tmp")
+            with open(tmp, "w") as f:
                 _json.dump(universe, f)
-        except Exception:
-            pass
+            tmp.replace(cache_file)
+        except Exception as e:
+            logger.warning(f"Universe cache write failed: {e}")
 
-        logger.info(f"Broad universe built: {len(universe)} liquid stocks")
+        logger.info(
+            f"Broad universe built: {len(universe)} liquid stocks "
+            f"(batches ok={universe_stats['batches_ok']} failed={universe_stats['batches_failed']} "
+            f"symbols dropped thin={universe_stats['sym_dropped_thin']} errors={universe_stats['sym_error']})"
+        )
         return universe
 
     def _fallback_universe(self) -> list[str]:
